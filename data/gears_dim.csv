@@ -1,0 +1,4 @@
+uuid,name,description,cost,armorImage,damageReduction,damageAbsorbtion,regenPool
+822bcab2-40a2-324e-c137-e09195ad7692,Heavy Armor,Absorbs 66% of total damage taken. Breaks after it has absorbed 50 damage.,1000,https://media.valorant-api.com/gear/822bcab2-40a2-324e-c137-e09195ad7692/displayicon.png,Partial,66%,
+4dec83d5-4902-9ab3-bed6-a7a390761157,Light Armor,Absorbs 66% of total damage taken. Breaks after it has absorbed 25 damage.,400,https://media.valorant-api.com/gear/4dec83d5-4902-9ab3-bed6-a7a390761157/displayicon.png,Partial,66%,
+b1b9086d-41bd-a516-5d29-e3b34a6f1644,Regen Shield,Absorbs 100% of total damage taken. Regenerates after it has absorbed damage. Has a total regeneration pool of 50.,650,https://media.valorant-api.com/gear/b1b9086d-41bd-a516-5d29-e3b34a6f1644/displayicon.png,Full,100%,50
