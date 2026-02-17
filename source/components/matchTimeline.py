@@ -5,6 +5,7 @@ import sys
 from source.utils import biased_hbl_percentages, divide_number_randomly
 from source.exceptions import CustomException
 from source.logger import logging
+#from source.components.jsonToPdTransformer.competitivetiers import competitivetiers_json_to_df
 #from src.components.users import synthetic_users
 
 #generating match timeline initial data
@@ -136,28 +137,36 @@ def generate_all_match_details(
         round_status_list = []
         agent_perf_status_list = []
         round_spike_status_list = []
+        match_summary_list = []
         
         for m_id in base_matches_df["match_id"].unique():
             logging.debug(f"Processing match {m_id}")
             match_data = base_matches_df[base_matches_df["match_id"] == m_id].reset_index(drop=True)
             match_df = pd.concat([match_df, team_division(match_data)], ignore_index=True)
             match_data_filtered = match_df[match_df["match_id"] == m_id].reset_index(drop=True)
-            match_status_per_match, round_status_per_match, agent_perf_status_per_match, round_spike_status_per_match = generating_full_match_details_per_round(
+            match_status_per_match, round_status_per_match, agent_perf_status_per_match, round_spike_status_per_match, match_summary = generating_full_match_details_per_round(
                 match_df=match_data_filtered, agents_df=agents_df
             )
             match_status_list.append(match_status_per_match.reset_index(drop=True))
             round_status_list.append(round_status_per_match.reset_index(drop=True))
             agent_perf_status_list.append(agent_perf_status_per_match.reset_index(drop=True))
             round_spike_status_list.append(round_spike_status_per_match.reset_index(drop=True))
+            match_summary_list.append(match_summary.reset_index(drop=True))
+            
         
         # Concatenate all results at once
         match_status = pd.concat(match_status_list, ignore_index=True) if match_status_list else pd.DataFrame()
         round_status = pd.concat(round_status_list, ignore_index=True) if round_status_list else pd.DataFrame()
         agent_perf_status = pd.concat(agent_perf_status_list, ignore_index=True).reset_index(drop=True) if agent_perf_status_list else pd.DataFrame()
         round_spike_status = pd.concat(round_spike_status_list, ignore_index=True) if round_spike_status_list else pd.DataFrame()
+        match_summary_status = pd.concat(match_summary_list,ignore_index=True) if match_summary_list else pd.DataFrame()
+
+        
+
+
         
         logging.info(f"Successfully completed generate_all_match_details")
-        return match_status,round_status,agent_perf_status,round_spike_status, match_df
+        return match_status,round_status,agent_perf_status,round_spike_status, match_df, match_summary_status
     
     except CustomException as e:
         logging.error(f"CustomException in generate_all_match_details: {str(e)}")
@@ -240,6 +249,7 @@ def generating_full_match_details_per_round(
         round_durations = {}
         round_spike_status = pd.DataFrame()
         agent_perf_status = pd.DataFrame()
+        match_summary = pd.DataFrame()
         for i in range (1, total_rounds + 1):
             round_id = f"{match_df['match_id'].iloc[0]}-R{i:02d}"
             logging.debug(f"Processing round {i}/{total_rounds}: {round_id}")
@@ -255,9 +265,10 @@ def generating_full_match_details_per_round(
                 row_dict["round_id"] = round_id
                 match_details.append(row_dict)
 
-            round_stats, round_spike_stat, attacker_round_win, defender_round_win, total_duration_round, agent_performance = events_per_round(round_df=pd.DataFrame(match_details)[pd.DataFrame(match_details)["round_id"]==round_id].reset_index(drop=True))
+            round_stats, round_spike_stat, attacker_round_win, defender_round_win, total_duration_round, agent_performance, per_player_round = events_per_round(round_df=pd.DataFrame(match_details)[pd.DataFrame(match_details)["round_id"]==round_id].reset_index(drop=True))
             round_details.extend(round_stats)
             agent_perf_status = pd.concat([agent_perf_status,agent_performance],axis=0, ignore_index=True)
+            match_summary = pd.concat([match_summary,per_player_round],axis=0,ignore_index = True)
             round_spike_status = pd.concat([round_spike_status,round_spike_stat],axis=0, ignore_index=True)
             attacker_round_wins+= attacker_round_win
             defender_round_wins+= defender_round_win
@@ -271,13 +282,24 @@ def generating_full_match_details_per_round(
         match_status = pd.DataFrame(round_details)["match_id"].drop_duplicates().reset_index(drop=True).to_frame()
         match_status["attacker_round_wins"] = attacker_round_wins
         match_status["defender_round_wins"] = defender_round_wins
+
+        match_summary = match_summary.groupby(["match_id","agent_name"],as_index=False).agg(
+            total_plants = ("plants","sum"),
+            total_deffused = ("defussed","sum"),
+            total_damage_dealt = ("total_outgoing_damage","sum"),
+            total_kills = ("killed","sum"),
+            total_deaths = ("death","sum"),
+            total_assists = ("assists","sum"),
+            first_bloods = ("got_first_blood","sum"),
+            ACV = ("round_combat_score","mean")
+            )
         
         round_df = pd.DataFrame(round_details)
         round_status = round_df[["match_id","round_id"]].drop_duplicates().reset_index(drop=True)
         round_status["total_round_duration"] = round_status["round_id"].map(round_durations)
 
         logging.info(f"Match details completed - {len(round_status)} rounds")
-        return match_status, round_status, agent_perf_status, round_spike_status
+        return match_status, round_status, agent_perf_status, round_spike_status, match_summary
     
     except Exception as e:
         error_msg = f"Error in generating_full_match_details_per_round: {str(e)}"
@@ -313,10 +335,11 @@ def events_per_round(
         kill_count_defender = {agent:0 for agent in round_df[round_df["isDefender"]==1]["agent_name"].tolist()}
 
         
-        agents_hit_damage = {agent:{ag: {"hit": {"head":0, "body":0, "leg":0},"damage":{"head":0,"body":0,"leg":0},"outgoing_damage":0, "incoming_damage":0} for ag in attacker_team+defender_team } for agent in attacker_team+defender_team}
+        agents_hit_damage = {agent:{ag: {"outgoing_damage": {"head":0, "body":0, "leg":0},"incoming_damage":{"head":0,"body":0,"leg":0},"total_outgoing_damage":0, "total_incoming_damage":0,"killed":0,"death":0 } for ag in attacker_team+defender_team} for agent in attacker_team+defender_team}
 
         dead_attackers = []
         dead_defenders = []
+        kill_events = [] 
 
         round_timer_expired = 0
         total_duration_round = None
@@ -329,7 +352,7 @@ def events_per_round(
         for row in round_df.itertuples(index=False):
             row_dict = dict(zip(round_df.columns, row))
 
-            row_dict, attacker_dict, defender_dict, team_spike_planted, team_spike_diffused, kill_count_attacker, kill_count_defender, attackers_alive, defenders_alive, agents_hit_damage = kill_death_simulation_by_damage(
+            row_dict, attacker_dict, defender_dict, team_spike_planted, team_spike_diffused, kill_count_attacker, kill_count_defender, attackers_alive, defenders_alive, agents_hit_damage,  kill_events, dead_attackers, dead_defenders = kill_death_simulation_by_damage(
                 row_dict=row_dict,
                 attacker_dict=attacker_dict,
                 defender_dict=defender_dict,
@@ -339,10 +362,14 @@ def events_per_round(
                 defenders_alive=defenders_alive,
                 team_spike_planted=team_spike_planted,
                 team_spike_diffused=team_spike_diffused,
-                agent_hit_damage=agents_hit_damage
+                agent_hit_damage=agents_hit_damage,
+                kill_events=kill_events,
+                dead_attackers = dead_attackers,
+                dead_defenders = dead_defenders
             )        
             records.append(row_dict)
 
+        
 
         if team_spike_planted == 1:
             if team_spike_diffused == 1:
@@ -389,12 +416,14 @@ def events_per_round(
             
             # Return a Series so it expands into multiple columns automatically
             return pd.Series({
-                "head_hit": stats.get("hit", {}).get("head", 0),
-                "body_hit": stats.get("hit", {}).get("body", 0),
-                "leg_hit": stats.get("hit", {}).get("leg", 0),
-                "head_damage": stats.get("damage", {}).get("head", 0),
-                "body_damage": stats.get("damage", {}).get("body", 0),
-                "leg_damage": stats.get("damage", {}).get("leg", 0),
+                "outgoing_head_damage": stats.get("outgoing_damage", {}).get("head", 0),
+                "outgoing_body_damage": stats.get("outgoing_damage", {}).get("body", 0),
+                "outgoing_leg_damage": stats.get("outgoing_damage", {}).get("leg", 0),
+                "incoming_head_damage": stats.get("incoming_damage", {}).get("head", 0),
+                "incoming_body_damage": stats.get("incoming_damage", {}).get("body", 0),
+                "incoming_leg_damage": stats.get("incoming_damage", {}).get("leg", 0),
+                "killed":stats.get("killed",0),
+                "death":stats.get("death",0)
             })
 
         # 4. Apply the mapping to the whole dataframe
@@ -402,13 +431,138 @@ def events_per_round(
         # Ensure stat_cols has the same index as agent_perf_per_round
         stat_cols.index = agent_perf_per_round.index
         agent_perf_per_round = pd.concat([agent_perf_per_round.reset_index(drop=True), stat_cols.reset_index(drop=True)], axis=1)
+        agent_perf_per_round.to_csv("data/temp_data.csv")
+        # ------------------------------------------------------------------
+        # NEW: aggregate to per-player-per-round and compute combat score
+        # ------------------------------------------------------------------
+
+        # Total damage this player dealt to all opponents in this round
+        dmg_per_player = (
+            agent_perf_per_round
+            .groupby(["match_id", "round_id", "agent_name"], as_index=False)[
+                ["outgoing_head_damage", "outgoing_body_damage", "outgoing_leg_damage","killed","death"]
+            ].sum()
+        )
+        dmg_per_player["total_outgoing_damage"] = (
+            dmg_per_player["outgoing_head_damage"]
+            + dmg_per_player["outgoing_body_damage"]
+            + dmg_per_player["outgoing_leg_damage"]
+        )
+
+        # Convert your 'records' list (row_dict per player) into a dataframe
+        records_df = pd.DataFrame(records)
+
+        # We only need one row per player per round from records_df
+        per_player_round = (
+            records_df[["match_id", "round_id", "agent_name", "plants", "defussed"]]
+            .drop_duplicates()
+            .reset_index(drop=True)
+        )
+
+        # Merge in total_damage
+        per_player_round = per_player_round.merge(
+            dmg_per_player[["match_id", "round_id", "agent_name", "total_outgoing_damage","killed","death"]],
+            on=["match_id", "round_id", "agent_name"],
+            how="left",
+        ).fillna({"total_outgoing_damage": 0})
+
+        
+
+        # -------------------------
+        # FIRST BLOOD & ASSISTS
+        # -------------------------
+
+        # First blood: first kill event in this round (if any)
+        first_blood_killer = None
+        first_blood_victim = None
+        if kill_events:
+            first_blood_killer = kill_events[0]["killer"]
+            first_blood_victim = kill_events[0]["victim"]
+
+        # Build damage summary per (attacker, victim) for this round
+        # We already have agents_hit_damage[attacker][victim]['damage'][...]
+        damage_summary = []
+        for attacker, vs_dict in agents_hit_damage.items():
+            for victim, stats in vs_dict.items():
+                total_damage = (
+                    stats.get("outgoing_damage", {}).get("head", 0)
+                    + stats.get("outgoing_damage", {}).get("body", 0)
+                    + stats.get("outgoing_damage", {}).get("leg", 0)
+                )
+                if total_damage > 0:
+                    damage_summary.append((attacker, victim, total_damage))
+
+        # Map victim -> all attackers who damaged them
+        victim_to_attackers = {}
+        for attacker, victim, dmg in damage_summary:
+            victim_to_attackers.setdefault(victim, []).append((attacker, dmg))
+
+        # Optionally: derive assists or first blood later; for now, set 0
+        per_player_round["assists"] = 0
+        per_player_round["got_first_blood"] = 0
+
+        # Mark first blood killer
+        if first_blood_killer is not None:
+            per_player_round.loc[
+                per_player_round["agent_name"] == first_blood_killer,
+                "got_first_blood"
+            ] = 1
+
+        # Assists: for each kill, any other attacker who damaged the victim gets an assist
+        assist_counter = {agent: 0 for agent in per_player_round["agent_name"].unique()}
+
+        for event in kill_events:
+            victim = event["victim"]
+            killer = event["killer"]
+
+            # Get all attackers who damaged this victim
+            helpers = victim_to_attackers.get(victim, [])
+
+            for helper_name, dmg in helpers:
+                if helper_name == killer:
+                    continue  # killer is not counted as assistant
+                assist_counter[helper_name] = assist_counter.get(helper_name, 0) + 1
+
+        # Fill assists in dataframe
+        per_player_round["assists"] = per_player_round["agent_name"].map(assist_counter).fillna(0).astype(int)
+
+        # Compute round combat score per player
+        def compute_round_combat_score(
+            damage_dealt: float,
+            kills: int,
+            assists: int = 0,
+            got_first_blood: bool = 0,
+            planted_spike: bool = 0,
+            defused_spike: bool = 0,
+        ) -> float:
+            damage_score = damage_dealt
+            kill_score = kills * 150
+            assist_score = assists * 40
+            fb_bonus = 30 if got_first_blood else 0
+            plant_bonus = 40 if planted_spike else 0
+            defuse_bonus = 40 if defused_spike else 0
+            return damage_score + kill_score + assist_score + fb_bonus + plant_bonus + defuse_bonus
+
+        per_player_round["round_combat_score"] = per_player_round.apply(
+            lambda r: compute_round_combat_score(
+                damage_dealt=r["total_outgoing_damage"],
+                kills=int(r["killed"]),
+                assists=int(r["assists"]),
+                got_first_blood=bool(r["got_first_blood"]),
+                planted_spike=bool(r["plants"]),
+                defused_spike=bool(r["defussed"]),
+            ),
+            axis=1,
+        )
+
+        
 
         round_spike_status = round_summary[["match_id","round_id"]].drop_duplicates().reset_index(drop = True)
         round_spike_status["spike_planted"] = team_spike_planted
         round_spike_status["spike_defused"] = team_spike_diffused
         logging.debug(f"Round {round_id} completed - Spike planted: {team_spike_planted}, Spike defused: {team_spike_diffused}")
             
-        return records, round_spike_status, attacker_round_win, defender_round_win, total_duration_round, agent_perf_per_round
+        return records, round_spike_status, attacker_round_win, defender_round_win, total_duration_round, agent_perf_per_round, per_player_round
     
     except Exception as e:
         error_msg = f"Error in events_per_round: {str(e)}"
@@ -525,14 +679,17 @@ def kill_death_simulation_by_damage(
         team_spike_diffused: int,
         attackers_alive: int,
         defenders_alive: int,
-        agent_hit_damage: Dict
+        agent_hit_damage: Dict,
+        kill_events: list, 
+        dead_attackers:list,
+        dead_defenders:list
 )->Dict[str, Any]:
     
     try:
         kill = 0
         death = 0
         
-        if row_dict["isAttacker"] == 1:
+        if row_dict["isAttacker"] == 1 and row_dict["agent_name"] not in dead_attackers:
             spike_planted = np.random.choice([0,1], p=[0.3,0.7]) if team_spike_planted != 1 else 0
             row_dict["plants"] = spike_planted
             team_spike_planted = spike_planted if team_spike_planted is None or team_spike_planted == 0 else team_spike_planted
@@ -545,21 +702,37 @@ def kill_death_simulation_by_damage(
                 
                 #attacker hit and damage pct per agent
                 
-                agent_hit_damage[(row_dict["agent_name"])][agent]["hit"]["head"] = head_hit_pct
-                agent_hit_damage[(row_dict["agent_name"])][agent]["hit"]["body"] = body_hit_pct
-                agent_hit_damage[(row_dict["agent_name"])][agent]["hit"]["leg"] = leg_hit_pct
-                agent_hit_damage[(row_dict["agent_name"])][agent]["damage"]["head"] = head_damage_pct
-                agent_hit_damage[(row_dict["agent_name"])][agent]["damage"]["body"] = body_damage_pct
-                agent_hit_damage[(row_dict["agent_name"])][agent]["damage"]["leg"] = leg_damage_pct
-                agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"] = hit_value
-                agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"] = damage_value
+                agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["head"] = head_hit_pct if agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["head"] == 0 else agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["head"]
+                agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["body"] = body_hit_pct if agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["body"] == 0 else agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["body"]
+                agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["leg"] = leg_hit_pct if  agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["leg"]== 0 else  agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["leg"]
+                agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["head"] = head_damage_pct if agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["head"] == 0 else agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["head"]
+                agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["body"] = body_damage_pct if agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["body"] == 0 else agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["body"]
+                agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["leg"] = leg_damage_pct if agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["leg"] == 0  else agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["leg"]
+                agent_hit_damage[(row_dict["agent_name"])][agent]["total_outgoing_damage"] = hit_value if agent_hit_damage[(row_dict["agent_name"])][agent]["total_outgoing_damage"] == 0 else agent_hit_damage[(row_dict["agent_name"])][agent]["total_outgoing_damage"]
+                agent_hit_damage[(row_dict["agent_name"])][agent]["total_incoming_damage"] = damage_value if agent_hit_damage[(row_dict["agent_name"])][agent]["total_incoming_damage"] == 0 else agent_hit_damage[(row_dict["agent_name"])][agent]["total_incoming_damage"]
+
+                agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["head"] = head_damage_pct if agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["head"] == 0 else agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["head"]
+                agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["body"] = body_damage_pct if agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["body"] == 0 else agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["body"]
+                agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["leg"] = leg_damage_pct if  agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["leg"]== 0 else  agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["leg"]
+                agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["head"] = head_hit_pct if agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["head"] == 0 else agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["head"]
+                agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["body"] = body_hit_pct if agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["body"] == 0 else agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["body"]
+                agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["leg"] = leg_hit_pct if agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["leg"] == 0  else agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["leg"]
+                agent_hit_damage[agent][(row_dict["agent_name"])]["total_outgoing_damage"] = damage_value if agent_hit_damage[agent][(row_dict["agent_name"])]["total_outgoing_damage"] == 0 else agent_hit_damage[agent][(row_dict["agent_name"])]["total_outgoing_damage"]
+                agent_hit_damage[agent][(row_dict["agent_name"])]["total_incoming_damage"] = hit_value if agent_hit_damage[agent][(row_dict["agent_name"])]["total_incoming_damage"] == 0 else agent_hit_damage[agent][(row_dict["agent_name"])]["total_incoming_damage"]
 
                 
                 if damage_value >= attacker_agent_health and attacker_agent_health >0:
                     attacker_dict[row_dict["agent_name"]] = 0
                     death = 1
                     kill_count_defender[agent] +=1
-                    defenders_alive -= 1
+                    attackers_alive-= 1
+                    agent_hit_damage[(row_dict["agent_name"])][agent]["death"]=1 if agent_hit_damage[(row_dict["agent_name"])][agent]["death"]==0 else agent_hit_damage[(row_dict["agent_name"])][agent]["death"]#death by the defender
+                    agent_hit_damage[agent][(row_dict["agent_name"])]["killed"]=1 if agent_hit_damage[agent][(row_dict["agent_name"])]["killed"] ==0 else agent_hit_damage[agent][(row_dict["agent_name"])]["killed"]
+                    kill_events.append({
+                        "victim": row_dict["agent_name"],
+                        "killer": agent,
+                    })
+                    dead_attackers.append(row_dict["agent_name"])
                     
                 else:
                     attacker_dict[row_dict["agent_name"]] = attacker_agent_health - damage_value
@@ -568,11 +741,20 @@ def kill_death_simulation_by_damage(
                     defender_dict[agent] = 0
                     kill_count_attacker[row_dict["agent_name"]] +=1
                     kill = kill_count_attacker[row_dict["agent_name"]]
-                    attackers_alive -= 1
+                    defenders_alive -= 1
+                    agent_hit_damage[(row_dict["agent_name"])][agent]["killed"] = 1 if agent_hit_damage[(row_dict["agent_name"])][agent]["killed"] == 0 else agent_hit_damage[(row_dict["agent_name"])][agent]["killed"] #defender killed by attacker
+                    agent_hit_damage[agent][(row_dict["agent_name"])]["death"] = 1 if agent_hit_damage[agent][(row_dict["agent_name"])]["death"] == 0 else agent_hit_damage[agent][(row_dict["agent_name"])]["death"]
+                    dead_defenders.append(agent)
+                    kill_events.append({
+                        "victim": agent,
+                        "killer": row_dict["agent_name"],
+                    })
+                    dead_attackers.append(row_dict["agent_name"])
+                    
                 else:
                     defender_dict[agent] = health - hit_value
 
-        elif row_dict["isDefender"] == 1:
+        elif row_dict["isDefender"] == 1 and row_dict["agent_name"] not in dead_defenders:
             spike_diffused = np.random.choice([0,1], p=[0.8,0.2]) if team_spike_planted == 1 and (team_spike_diffused is None or team_spike_diffused == 0) else 0
             row_dict["defussed"] = spike_diffused
             team_spike_diffused = spike_diffused if team_spike_diffused is None or team_spike_diffused == 0 else team_spike_diffused
@@ -583,21 +765,37 @@ def kill_death_simulation_by_damage(
                 head_hit_pct, body_hit_pct, leg_hit_pct = biased_hbl_percentages(value = hit_value)
                 head_damage_pct, body_damage_pct, leg_damage_pct = biased_hbl_percentages(value = damage_value)
                 
-                agent_hit_damage[(row_dict["agent_name"])][agent]["hit"]["head"] = head_hit_pct
-                agent_hit_damage[(row_dict["agent_name"])][agent]["hit"]["body"] = body_hit_pct
-                agent_hit_damage[(row_dict["agent_name"])][agent]["hit"]["leg"] = leg_hit_pct
-                agent_hit_damage[(row_dict["agent_name"])][agent]["damage"]["head"] = head_damage_pct
-                agent_hit_damage[(row_dict["agent_name"])][agent]["damage"]["body"] = body_damage_pct
-                agent_hit_damage[(row_dict["agent_name"])][agent]["damage"]["leg"] = leg_damage_pct
-                agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"] = hit_value
-                agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"] = damage_value
+                agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["head"] = head_hit_pct if agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["head"] == 0 else agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["head"]
+                agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["body"] = body_hit_pct if agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["body"] == 0 else agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["body"]
+                agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["leg"] = leg_hit_pct if  agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["leg"]== 0 else  agent_hit_damage[(row_dict["agent_name"])][agent]["outgoing_damage"]["leg"]
+                agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["head"] = head_damage_pct if agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["head"] == 0 else agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["head"]
+                agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["body"] = body_damage_pct if agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["body"] == 0 else agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["body"]
+                agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["leg"] = leg_damage_pct if agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["leg"] == 0  else agent_hit_damage[(row_dict["agent_name"])][agent]["incoming_damage"]["leg"]
+                agent_hit_damage[(row_dict["agent_name"])][agent]["total_outgoing_damage"] = hit_value if agent_hit_damage[(row_dict["agent_name"])][agent]["total_outgoing_damage"] == 0 else agent_hit_damage[(row_dict["agent_name"])][agent]["total_outgoing_damage"]
+                agent_hit_damage[(row_dict["agent_name"])][agent]["total_incoming_damage"] = damage_value if agent_hit_damage[(row_dict["agent_name"])][agent]["total_incoming_damage"] == 0 else agent_hit_damage[(row_dict["agent_name"])][agent]["total_incoming_damage"]
+
+                agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["head"] = head_damage_pct if agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["head"] == 0 else agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["head"]
+                agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["body"] = body_damage_pct if agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["body"] == 0 else agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["body"]
+                agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["leg"] = leg_damage_pct if  agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["leg"]== 0 else  agent_hit_damage[agent][(row_dict["agent_name"])]["outgoing_damage"]["leg"]
+                agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["head"] = head_hit_pct if agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["head"] == 0 else agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["head"]
+                agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["body"] = body_hit_pct if agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["body"] == 0 else agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["body"]
+                agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["leg"] = leg_hit_pct if agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["leg"] == 0  else agent_hit_damage[agent][(row_dict["agent_name"])]["incoming_damage"]["leg"]
+                agent_hit_damage[agent][(row_dict["agent_name"])]["total_outgoing_damage"] = damage_value if agent_hit_damage[agent][(row_dict["agent_name"])]["total_outgoing_damage"] == 0 else agent_hit_damage[agent][(row_dict["agent_name"])]["total_outgoing_damage"]
+                agent_hit_damage[agent][(row_dict["agent_name"])]["total_incoming_damage"] = hit_value if agent_hit_damage[agent][(row_dict["agent_name"])]["total_incoming_damage"] == 0 else agent_hit_damage[agent][(row_dict["agent_name"])]["total_incoming_damage"]
+
                 
                 if damage_value >= defender_agent_health and defender_agent_health >0:
                     defender_dict[row_dict["agent_name"]] = 0
                     death = 1
                     kill_count_attacker[agent] +=1
-                    attackers_alive -= 1
-                    
+                    defenders_alive -= 1
+                    agent_hit_damage[(row_dict["agent_name"])][agent]["death"]=1 if agent_hit_damage[(row_dict["agent_name"])][agent]["death"]== 0 else agent_hit_damage[(row_dict["agent_name"])][agent]["death"] #death by the attacker
+                    agent_hit_damage[agent][(row_dict["agent_name"])]["killed"] = 1 if agent_hit_damage[agent][(row_dict["agent_name"])]["killed"] == 0 else agent_hit_damage[agent][(row_dict["agent_name"])]["killed"]
+                    kill_events.append({
+                        "victim": row_dict["agent_name"],
+                        "killer": agent,
+                    })
+
                 else:
                     defender_dict[row_dict["agent_name"]] = defender_agent_health - damage_value
 
@@ -605,18 +803,237 @@ def kill_death_simulation_by_damage(
                     attacker_dict[agent] = 0
                     kill_count_defender[row_dict["agent_name"]] +=1
                     kill = kill_count_defender[row_dict["agent_name"]]
-                    defenders_alive -= 1
+                    attackers_alive -= 1
+                    agent_hit_damage[(row_dict["agent_name"])][agent]["killed"] = 1 if agent_hit_damage[(row_dict["agent_name"])][agent]["killed"] == 0 else agent_hit_damage[(row_dict["agent_name"])][agent]["killed"]#attacker killed by the defender
+                    agent_hit_damage[agent][(row_dict["agent_name"])]["death"] = 1 if agent_hit_damage[agent][(row_dict["agent_name"])]["death"] == 0 else agent_hit_damage[agent][(row_dict["agent_name"])]["death"]
+                    kill_events.append({
+                        "victim": agent,
+                        "killer": row_dict["agent_name"],
+                    })
                 else:
                     attacker_dict[agent] = health - hit_value
-        row_dict["kills"] = kill
-        row_dict["death"] = death
+        
 
-        return row_dict, attacker_dict, defender_dict, team_spike_planted, team_spike_diffused, kill_count_attacker, kill_count_defender, attackers_alive, defenders_alive, agent_hit_damage
+        return row_dict, attacker_dict, defender_dict, team_spike_planted, team_spike_diffused, kill_count_attacker, kill_count_defender, attackers_alive, defenders_alive, agent_hit_damage, kill_events, dead_attackers, dead_defenders
 
     except Exception as e:
         error_msg = f"Error in kill_deat_simulation: {str(e)}"
         logging.error(error_msg)
         raise CustomException(error_msg, sys)
+
+
+# def build_match_summary_with_metadata(
+#         match_df: pd.DataFrame(),
+#         match_summary: pd.DataFrame(),
+#         match_status:pd.DataFrame()
+
+# ):
+
+#     pass
+
+def build_match_summary_with_metadata(
+    match_summary: pd.DataFrame,
+    match_df: pd.DataFrame,
+    match_status: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Returns match_summary enriched with:
+      - user_id
+      - team A / team B
+      - attacker_round_wins, defender_round_wins
+      - team_rounds_won, team_rounds_lost
+      - result (win/loss)
+      - team_acs_mean (per match × team)
+    """
+    # 1) Attach user_id and team flags
+    ms = match_summary.merge(
+        match_df[["match_id", "agent_name", "user_id", "team A", "team B"]].drop_duplicates(),
+        on=["match_id", "agent_name"],
+        how="left",
+    )
+
+    # 2) Attach match round outcomes
+    ms = ms.merge(
+        match_status[["match_id", "attacker_round_wins", "defender_round_wins"]],
+        on="match_id",
+        how="left",
+    )
+
+    # 3) Map team A / team B to side (attackers/defenders) for the match
+    # In your current logic: team A starts attackers, team B defenders.
+    ms["player_side"] = np.where(ms["team A"] == 1, "attackers", "defenders")
+
+    # 4) For this match, determine which side won
+    ms["winner_side"] = np.where(
+        ms["attacker_round_wins"] > ms["defender_round_wins"],
+        "attackers",
+        "defenders",
+    )
+
+    # 5) Per player result
+    ms["result"] = np.where(ms["player_side"] == ms["winner_side"], "win", "loss")
+
+    # 6) Compute team rounds won/lost for each player
+    ms["team_rounds_won"] = np.where(
+        ms["player_side"] == "attackers",
+        ms["attacker_round_wins"],
+        ms["defender_round_wins"],
+    )
+    ms["team_rounds_lost"] = np.where(
+        ms["player_side"] == "attackers",
+        ms["defender_round_wins"],
+        ms["attacker_round_wins"],
+    )
+
+    # 7) Compute team ACS mean (per match × team)
+    ms["team_key"] = np.where(ms["team A"] == 1, "A", "B")
+    team_acs = (
+        ms.groupby(["match_id", "team_key"], as_index=False)["ACV"]
+        .mean()
+        .rename(columns={"ACV": "team_acs_mean"})
+    )
+
+    ms = ms.merge(
+        team_acs,
+        on=["match_id", "team_key"],
+        how="left",
+    )
+
+    return ms
+
+def compute_margin_factor(team_rounds_won: int, team_rounds_lost: int) -> tuple[float, int]:
+    margin = team_rounds_won - team_rounds_lost
+    abs_margin = abs(margin)
+    base = 0.5 + (abs_margin / 13.0)  # 0.5–1.5
+    return base, margin
+
+def compute_performance_factor(player_acs: float, team_acs_mean: float) -> float:
+    if team_acs_mean <= 0:
+        return 1.0
+    ratio = player_acs / team_acs_mean
+    return max(0.5, min(1.5, ratio))
+
+def compute_radiant_delta(
+    result: str,
+    team_rounds_won: int,
+    team_rounds_lost: int,
+    player_acs: float,
+    team_acs_mean: float,
+) -> int:
+    margin_factor, margin = compute_margin_factor(team_rounds_won, team_rounds_lost)
+    perf_factor = compute_performance_factor(player_acs, team_acs_mean)
+
+    if result == "win":
+        base = 10
+        delta = base * margin_factor * perf_factor
+    elif result == "loss":
+        base = -8
+        delta = base * margin_factor * perf_factor
+    else:
+        base = 2
+        delta = base * perf_factor
+
+    delta = int(max(-40, min(40, round(delta))))
+    return delta
+
+"""RANK_TIERS = [
+    "Unranked",
+    "Iron 1", "Iron 2", "Iron 3",
+    "Bronze 1", "Bronze 2", "Bronze 3",
+    "Silver 1", "Silver 2", "Silver 3",
+    "Gold 1", "Gold 2", "Gold 3",
+    "Platinum 1", "Platinum 2", "Platinum 3",
+    "Diamond 1", "Diamond 2", "Diamond 3",
+    "Ascendant 1", "Ascendant 2", "Ascendant 3",
+    "Immortal 1", "Immortal 2", "Immortal 3",
+    "Radiant",
+]
+"""
+def initial_rank_state():
+    return {"rank_index": 0, "points": 0}
+
+def apply_radiant_change(state: dict, delta: int, RANK_TIERS: List) -> dict:
+    idx = state["rank_index"]
+    pts = state["points"]
+
+    new_pts = pts + delta
+
+    # Demotion
+    if new_pts < 0:
+        if idx > 0:
+            idx -= 1
+        new_pts = 0
+
+    # Promotion (Radiant = 100 points)
+    while new_pts >= 100:
+        new_pts -= 100
+        if idx < len(RANK_TIERS) - 1:
+            idx += 1
+            if new_pts < 10:
+                new_pts = 10
+
+    state["rank_index"] = idx
+    state["points"] = new_pts
+    return state
+
+def simulate_rank_progression(
+    match_summary: pd.DataFrame,
+    match_df: pd.DataFrame,
+    match_status: pd.DataFrame,
+    competitive_tiers: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Returns a rank_history df with one row per (match_id, user_id)
+    including rank/points before & after each match.
+    """
+    ms_meta = build_match_summary_with_metadata(
+        match_summary=match_summary,
+        match_df=match_df,
+        match_status=match_status,
+    )
+
+    RANK_TIERS = competitive_tiers
+
+    # Sort by match_id so progression is chronological
+    df = ms_meta.sort_values("match_id").reset_index(drop=True)
+
+    rank_states: dict[str, dict] = {}
+    history = []
+
+    for _, row in df.iterrows():
+        user = row["user_id"]
+        if user not in rank_states:
+            rank_states[user] = initial_rank_state()
+
+        prev_state = rank_states[user].copy()
+
+        delta = compute_radiant_delta(
+            result=row["result"],
+            team_rounds_won=int(row["team_rounds_won"]),
+            team_rounds_lost=int(row["team_rounds_lost"]),
+            player_acs=float(row["ACV"]),
+            team_acs_mean=float(row["team_acs_mean"]),
+        )
+
+        new_state = apply_radiant_change(rank_states[user], delta, RANK_TIERS=RANK_TIERS)
+
+        history.append({
+            "match_id": row["match_id"],
+            "user_id": user,
+            "agent_name": row["agent_name"],
+            "result": row["result"],
+            "team_rounds_won": int(row["team_rounds_won"]),
+            "team_rounds_lost": int(row["team_rounds_lost"]),
+            "avg_combat_score": float(row["ACV"]),
+            "team_acs_mean": float(row["team_acs_mean"]),
+            "radiant_delta": delta,
+            "rank_before": RANK_TIERS[prev_state["rank_index"]],
+            "points_before": prev_state["points"],
+            "rank_after": RANK_TIERS[new_state["rank_index"]],
+            "points_after": new_state["points"],
+        })
+
+    return pd.DataFrame(history)
 
 
 if __name__ == "__main__":
@@ -632,11 +1049,27 @@ if __name__ == "__main__":
         logging.info(f"Successfully loaded input files - users: {users_df.shape}, agents: {agents_df.shape}, maps: {maps_df.shape}")
         
         logging.info("Generating match timeline...")
-        match_status, round_status, agent_perf_status, round_spike_status, match_df = generate_all_match_details(
+        match_status, round_status, agent_perf_status, round_spike_status, match_df, match_summary = generate_all_match_details(
             users_df,
             agents_df,
             maps_df
         )
+        
+        competitive_tiers_all = pd.read_csv("data/competitive_tiers_dim.csv")["Rank"].tolist()
+        remove = {"Unused1", "Unused2"}
+        competitive_tiers = [x for x in competitive_tiers_all if x not in remove]  
+
+        rank_history = simulate_rank_progression(
+        match_summary=match_summary,
+        match_df=match_df,
+        match_status=match_status,
+        competitive_tiers = competitive_tiers
+        )
+
+        rank_history.to_csv("data/rank_history.csv", index=False)
+        
+        match_df.to_csv("data/match_df.csv")
+
         
         logging.info("Writing output CSV files...")
         match_status.to_csv("data/match_status.csv", index=False)
@@ -650,6 +1083,9 @@ if __name__ == "__main__":
         
         round_spike_status.to_csv("data/round_spike_status.csv", index=False)
         logging.info(f"Saved round_spike_status to data/round_spike_status.csv (shape: {round_spike_status.shape})")
+
+        match_summary.to_csv("data/match_summary.csv",index = False)
+        logging.info(f"Saved match_summary to data/match_summary.csv (shape: {match_summary.shape})")
         
         logging.info("=" * 80)
         logging.info("Match Timeline Generation Completed Successfully!")

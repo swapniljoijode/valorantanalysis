@@ -4,7 +4,7 @@ from source.components.jsonToPdTransformer.competitivetiers import competitiveti
 from typing import List, Dict, Any
 
 # Number of synthetic users
-def synthetic_users(data: pd.DataFrame) -> pd.DataFrame:
+def synthetic_users(competitive_rank_tier_data: pd.DataFrame) -> pd.DataFrame:
     n_users = 1000
 
     # 1) Username: player0001 ... player1000
@@ -27,7 +27,7 @@ def synthetic_users(data: pd.DataFrame) -> pd.DataFrame:
 
     # 4) Rank tier: all start as 'Unranked' (get UUID from competitivetiers data)
 
-    unranked_tier_uuid = data[data['Rank'] == 'UNRANKED']['uuid'].values[0]
+    unranked_tier_uuid = competitive_rank_tier_data[competitive_rank_tier_data['Rank'] == 'UNRANKED']['uuid'].values[0]
     # 4) Build DimUser DataFrame
     df_users = pd.DataFrame({
         "user_id": range(1, n_users + 1),          # surrogate key
