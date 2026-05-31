@@ -67,7 +67,8 @@ Game Data Pipeline/
 ├── requirements.txt
 ├── .env.example                      # Template for warehouse credentials
 │
-├── data/                             # CSV landing zone (one file per table)
+├── data/                             # CSV landing zone — GENERATED, NOT tracked in git
+│   │                                 # (gitignored; recreated by `python main.py`)
 │   ├── agents_dim.csv  weapons_dim.csv  maps_dim.csv  gamemodes_dim.csv
 │   ├── gears_dim.csv   competitive_tiers_dim.csv  users_dim.csv
 │   ├── match_df.csv    match_status.csv  round_status.csv
@@ -94,6 +95,8 @@ Game Data Pipeline/
         ├── staging/                  # 15 staging views (stg_*) + sources/tests
         └── marts/                    # 9 marts (dims, fact, analytics) + tests
 ```
+
+> **Generated artifacts are not version-controlled.** The `data/` CSV outputs and any local virtual environment (`dbt_venv/`, conda envs) are gitignored — they're reproducible by running the pipeline, and some CSVs exceed git/GitHub size limits. Only source code, dbt models, and config live in the repo. Run `python main.py` to regenerate the `data/` folder from scratch.
 
 ---
 
