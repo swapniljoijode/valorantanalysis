@@ -1,564 +1,278 @@
-# Valorant Analysis
+# Valorant Game Data Pipeline
 
-A comprehensive data generation and simulation framework for analyzing Valorant gameplay. This project fetches game metadata from the Valorant API, transforms it into structured data, and generates synthetic match timelines with detailed player performance metrics.
+An end-to-end **ELT data engineering project** built around Valorant gameplay data. It fetches game metadata from the Valorant API, simulates realistic match timelines and rank progression in Python, loads everything into a **PostgreSQL** warehouse, and models it into clean, tested analytics tables with **dbt**.
+
+The result is a dimensional (star-schema) warehouse with analytical marts for player performance, agent pick rates, map win rates, rank distribution, and credit economy — the kind of stack you'd run in production, scaled down to a laptop.
 
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Project Status](#project-status)
-- [Future Use Cases](#future-use-cases)
-- [Project Structure](#project-structure)
 - [Architecture](#architecture)
-- [Core Logic](#core-logic)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Data Output](#data-output)
+- [Tech Stack](#tech-stack)
+- [Project Structure](#project-structure)
+- [Data Model](#data-model)
+- [Analytical Marts](#analytical-marts)
+- [Quickstart](#quickstart)
+- [Pipeline Details](#pipeline-details)
+- [Simulation Logic](#simulation-logic)
+- [Testing](#testing)
 - [Configuration](#configuration)
-- [Logging](#logging)
-- [Roadmap](#roadmap)
 - [Troubleshooting](#troubleshooting)
+- [Roadmap](#roadmap)
 
 ---
 
-## Overview
+## Architecture
 
-**Status**: 🚧 In Active Development
+This is a classic **ELT** pipeline: extract + load raw data first, then transform inside the warehouse with dbt.
 
-The Valorant Analysis project serves two primary functions:
+```
+┌──────────────┐   extract/    ┌──────────────┐   load     ┌─────────────────────────────────────┐
+│ Valorant API │──transform──▶ │ Python (CSV) │──to_sql──▶ │           PostgreSQL                │
+└──────────────┘   + simulate  └──────────────┘            │                                     │
+                                                           │  raw  ──▶  staging  ──▶  marts      │
+                                                           │ (tables)   (views)      (tables)    │
+                                                           │            └────────── dbt ─────────┘
+                                                           └─────────────────────────────────────┘
+```
 
-1. **API Data Pipeline**: Fetches Valorant game metadata (agents, weapons, maps, competitive tiers) from the official Valorant API and transforms it into structured CSV files.
-2. **Match Timeline Simulator**: Generates synthetic match data with realistic round-by-round gameplay, including kill/death events, spike plants/defuses, and individual player performance metrics.
-
-This framework is designed to provide a scalable foundation for:
-- Building data warehouses for Valorant analytics
-- Training ML models on game state and player behavior
-- Analyzing player performance patterns and progression
-- Understanding game mechanics at scale
-- Developing predictive models for match outcomes and player rankings
-
-### Current Capabilities ✅
-- API metadata fetching and transformation
-- Synthetic match generation with team assignments
-- Round-by-round simulation (25 rounds per match)
-- Basic kill/death event simulation
-- Spike plant/defuse mechanics
-- Per-agent performance statistics
-- Comprehensive logging and error handling
-
-### Planned Features 🚀
-- Weapon economy system (credits per round)
-- Advanced hit-damage mechanics (armor, shields, abilities)
-- Weapon selection logic per round based on economy
-- Match summary generation
-- Player rank progression tracking
-- Matchmaking by rank tier
-- Advanced game state indicators
+| Stage | What happens | Where |
+|-------|--------------|-------|
+| **Extract** | Pull agents, weapons, maps, gamemodes, gears, tiers from the Valorant API | `source/components/apiClient` |
+| **Transform (Python)** | JSON → DataFrames; generate synthetic users, match timelines, and rank progression | `source/components/jsonToPdTransformer`, `matchTimeline.py` |
+| **Load** | Write DataFrames to the Postgres `raw` schema (also persisted as CSVs) | `source/components/warehouse/postgres_loader.py` |
+| **Transform (dbt)** | `raw` → `staging` (clean, typed views) → `marts` (star schema + analytics tables) | `valorant_dbt/` |
 
 ---
 
-## Project Status
+## Tech Stack
 
-### Current Development Phase: **Alpha**
+- **Python 3.13** — extraction, simulation, loading (`pandas`, `requests`, `SQLAlchemy`, `psycopg2`)
+- **PostgreSQL 16** — warehouse, run locally via **Docker** (`docker-compose`)
+- **dbt** (`dbt-core` + `dbt-postgres`) — in-warehouse transformations, testing, and docs
+- **pytest** — integration tests for the warehouse loader
+- **python-dotenv** — environment-based configuration
 
-The project is actively under development with core simulation mechanics in place. The foundation supports:
-- ✅ Match data generation
-- ✅ Player performance tracking
-- ✅ Round mechanics (planting/defusing spikes)
-- ⏳ **In Progress**: Weapon economy and advanced damage mechanics
-- ⏳ **Planned**: Rank progression and matchmaking improvements
-
----
-
-## Future Use Cases
-
-This project is designed to support future machine learning and analytical applications:
-
-### 1. **Predictive Modeling**
-- **Win Probability Models**: Predict match outcomes based on player composition, rank distribution, and map selection
-- **Player Performance Prediction**: Forecast individual player KDA, round survival rates, and economy management
-- **Ranking Systems**: Build models to predict rank progression and tier advancement
-
-### 2. **Anomaly Detection**
-- Detect unusual player behavior patterns (e.g., sharp skill changes)
-- Identify potential smurfing or account boosting
-- Flag suspicious win/loss streaks and match patterns
-
-### 3. **Agent/Meta Analysis**
-- Analyze agent win rates across different rank tiers
-- Study meta shifts based on balance changes
-- Correlate agent selections with team composition outcomes
-- Identify optimal team compositions
-
-### 4. **Matchmaking Optimization**
-- Develop balanced team creation algorithms
-- Optimize rank-based player pairings
-- Reduce rank-based imbalance in matches
-- Predict competitive fairness metrics
-
-### 5. **Economic System Analysis**
-- Model optimal weapon buy patterns per round
-- Analyze economy reset strategies
-- Predict round outcomes based on economy state
-- Study pistol round strategy effectiveness
-
-### 6. **Player Development Tracking**
-- Create skill progression models
-- Identify learning curves and skill plateaus
-- Benchmark player improvements over time
-- Recommend practice focus areas
-
-### 7. **Esports Analytics**
-- Team composition strength evaluation
-- Historical match data analysis and replay systems
-- Player talent identification and scouting
-- Tournament predictions and simulations
-
-### 8. **Game Design Insights**
-- Map balance analysis through gameplay data
-- Agent ability effectiveness measurement
-- Round economy impact on game dynamics
-- Meta evolution tracking
+> **Note on dbt:** this project pins `dbt-core` + `dbt-postgres` inside an isolated `dbt_venv`. A globally installed `dbt` may be **dbt-fusion**, which does not support a Postgres adapter — hence the dedicated venv. See [Quickstart](#quickstart).
 
 ---
 
 ## Project Structure
 
 ```
-ValorantAnalysis/
-├── main.py                          # Entry point for API data pipeline
-├── requirements.txt                 # Project dependencies
-├── setup.py                         # Package installation configuration
+Game Data Pipeline/
+├── main.py                           # Pipeline entry point (extract → simulate → load)
+├── docker-compose.yml                # PostgreSQL 16 service
+├── requirements.txt
+├── .env.example                      # Template for warehouse credentials
 │
-├── data/                            # Output directory for generated CSVs
-│   ├── agents_dim.csv               # Agent metadata (name, role, abilities)
-│   ├── weapons_dim.csv              # Weapon specifications
-│   ├── maps_dim.csv                 # Map information
-│   ├── gamemodes_dim.csv            # Game mode definitions
-│   ├── gears_dim.csv                # Equipment/gear data
-│   ├── competitive_tiers_dim.csv    # Rank/tier definitions
-│   ├── users_dim.csv                # Synthetic user profiles
-│   ├── match_status.csv             # Match-level results
-│   ├── round_status.csv             # Round-level statistics
-│   ├── agent_perf_status.csv        # Per-agent performance metrics
-│   └── round_spike_status.csv       # Spike plant/defuse events
+├── data/                             # CSV landing zone (one file per table)
+│   ├── agents_dim.csv  weapons_dim.csv  maps_dim.csv  gamemodes_dim.csv
+│   ├── gears_dim.csv   competitive_tiers_dim.csv  users_dim.csv
+│   ├── match_df.csv    match_status.csv  round_status.csv
+│   ├── agent_perf_status.csv  round_spike_status.csv
+│   ├── match_summary.csv  rank_history.csv  weapon_economy.csv
 │
-└── source/                          # Main source code
-    ├── __init__.py
-    ├── logger.py                    # Logging configuration
-    ├── exceptions.py                # Custom exception classes
-    ├── utils.py                     # Utility functions
-    │
-    ├── components/
-    │   ├── matchTimeline.py         # Match simulation engine
-    │   ├── users.py                 # Synthetic user generation
-    │   │
-    │   ├── apiClient/
-    │   │   └── valorant_api_client.py    # Valorant API integration
-    │   │
-    │   └── jsonToPdTransformer/
-    │       ├── agents.py            # JSON → DataFrame transformers
-    │       ├── weapons.py
-    │       ├── maps.py
-    │       ├── gamemodes.py
-    │       ├── gears.py
-    │       └── competitivetiers.py
+├── source/                           # Python source
+│   ├── logger.py  exceptions.py  utils.py
+│   └── components/
+│       ├── matchTimeline.py          # Match + rank-progression simulation engine
+│       ├── users.py                  # Synthetic player generation
+│       ├── apiClient/                # Valorant API client
+│       ├── jsonToPdTransformer/      # JSON → DataFrame transformers
+│       └── warehouse/
+│           └── postgres_loader.py    # DataFrame → Postgres loader
+│
+├── tests/
+│   └── test_postgres_loader.py       # pytest integration tests
+│
+└── valorant_dbt/                     # dbt project
+    ├── dbt_project.yml  profiles.yml
+    ├── macros/generate_schema_name.sql
+    └── models/
+        ├── staging/                  # 15 staging views (stg_*) + sources/tests
+        └── marts/                    # 9 marts (dims, fact, analytics) + tests
 ```
 
 ---
 
-## Architecture
+## Data Model
 
-### Three-Layer Architecture
+Data flows through three schemas in Postgres, each a transformation layer.
 
-```
-┌─────────────────────────────────────────────┐
-│ Presentation Layer                          │
-│ (main.py)                                   │
-└──────────────┬──────────────────────────────┘
-               │
-┌──────────────▼──────────────────────────────┐
-│ Logic Layer                                 │
-│ - API Client (valorant_api_client.py)       │
-│ - Transformers (jsonToPdTransformer/)       │
-│ - Simulation (matchTimeline.py functions)   │
-└──────────────┬──────────────────────────────┘
-               │
-┌──────────────▼──────────────────────────────┐
-│ Data Layer                                  │
-│ - External API (Valorant)                   │
-│ - CSV Storage (data/)                       │
-└─────────────────────────────────────────────┘
-```
+### `raw` (loaded by Python)
+15 tables landed verbatim from the pipeline — API dimensions, synthetic users, and simulated facts (including `weapon_economy`, one row per player per round). This is the immutable source of truth dbt builds on.
 
-### Data Pipeline Flow
+### `staging` (dbt views — `stg_*`)
+One view per raw table. Light, non-destructive cleanup only: renaming to `snake_case`, casting types, fixing booleans (`col = 1`), and standardizing keys. Quoted mixed-case source columns (e.g. `"isAttacker"`, `"ACV"`) are normalized here.
 
-```
-Valorant API
-    ↓
-ValorantAPIClient
-    ↓
-JSON Response
-    ↓
-Transformers (jsonToPdTransformer)
-    ↓
-DataFrame Objects
-    ↓
-CSV Export (data/)
-```
+### `marts` (dbt tables — star schema + analytics)
 
-### Match Simulation Flow
+**Dimensions & fact:**
 
-```
-users_df + agents_df + maps_df
-    ↓
-generate_all_match_details()
-    ├─ Generate match base data
-    ├─ For each match:
-    │   ├─ team_division() - Assign teams
-    │   ├─ generating_full_match_details_per_round() - 25 rounds
-    │   │   ├─ team_side_assignment() - Set attacker/defender
-    │   │   ├─ events_per_round() - Simulate combat
-    │   │   │   ├─ kill_death_simulation_by_damage()
-    │   │   │   └─ Compute spike plant/defuse
-    │   │   ├─ compute_round_duration_seconds()
-    │   │   └─ Track player stats/kills/deaths
-    │   └─ Aggregate match results
-    ↓
-match_status, round_status, agent_perf_status, round_spike_status
-    ↓
-CSV Export
-```
+| Model | Grain | Notes |
+|-------|-------|-------|
+| `dim_players` | one row per player (1,000) | `riot_id = username \|\| tagline`; rank lives in the fact, not here |
+| `dim_agents` | one row per agent | |
+| `dim_maps` | one row per map | |
+| `fct_player_match` | **one row per player per match** (~10,220) | joins participation + per-agent combat stats + rank movement; `is_win`, KDA, combat score, `rank_before`/`rank_after` |
+
+`fct_player_match` is the central fact: `match_player_id = match_id || '-' || user_id`, combining `stg_matches` (participation), `stg_match_summary` (combat stats, joined on `match_id + agent_name`), and `stg_rank_history` (rank movement, joined on `match_id + user_id`).
 
 ---
 
-## Core Logic
+## Analytical Marts
 
-### 1. API Data Pipeline (main.py)
+Five analytics tables sit on top of the fact, ready for BI / dashboards:
 
-Fetches Valorant metadata and transforms into structured dimensions:
+| Mart | Question it answers |
+|------|---------------------|
+| `mart_player_performance` | Per-player career stats: matches, win rate, K/D, total kills/deaths/assists, first bloods, avg combat score, and **current rank** (rank after most recent match) |
+| `mart_agent_pickrate` | How often each agent is picked (pick rate), and how well they perform (win rate, K/D, avg combat score) |
+| `mart_map_winrate` | Per-map activity, player win rate, and attacker vs. defender round-win balance |
+| `mart_rank_distribution` | Current rank distribution across the player base (players per rank, share, avg points) |
+| `mart_player_economy` | Per-player credit economy: rounds played, avg credits banked/spent, total earned/spent, full-buy rate, and pistol-round win rate |
 
-```python
-# Step 1: Initialize API client
-client = ValorantAPIClient()
-
-# Step 2: Fetch raw JSON from Valorant API
-agents_json = client.get_agents()
-weapons_json = client.get_weapons()
-maps_json = client.get_maps()
-# ... etc
-
-# Step 3: Transform JSON to DataFrames
-df_agents = agents_json_to_df(agents_json)
-df_weapons = weapons_json_to_df(weapons_json)
-# ... etc
-
-# Step 4: Export to CSV
-df_agents.to_csv("data/agents_dim.csv", index=False)
-```
-
-**Output Tables:**
-- `agents_dim`: Agent UUID, display name, role, abilities
-- `weapons_dim`: Weapon specifications, costs, damage
-- `maps_dim`: Map identifiers and metadata
-- `gamemodes_dim`: Game mode definitions
-- `competitive_tiers_dim`: Rank/tier systems
-- `users_dim`: Synthetic user profiles with join dates
-
-### 2. Synthetic User Generation (users.py)
-
-Creates synthetic player profiles:
-- User ID and join date (distributed over time)
-- Associated competitive tier
-- Randomized player attributes
-
-### 3. Match Timeline Simulation (matchTimeline.py)
-
-Generates realistic match data through multi-level simulation:
-
-#### **Match Level**
-- Creates matches with 10 unique players
-- Assigns players to 2 teams (5 per team)
-- Selects a map for the match
-
-#### **Round Level (25 rounds per match)**
-- **Rounds 1-12**: Team A starts as attackers
-- **Round 13**: Teams swap sides
-- **Rounds 14-25**: Team B becomes attackers
-- Match ends when one team reaches 13 round wins
-
-#### **Event Level (Per Round)**
-- **Attacker Role**: Plant spike on the map
-- **Defender Role**: Prevent spike plant or defuse planted spike
-- **Combat**: Kill/death simulations based on damage calculations
-- **Outcome**: Determine round winner (attackers or defenders)
-
-#### **Key Simulation Details**
-
-**Damage Simulation:**
-- Each player has 250 HP (base health)
-- Random damage values (0-255) per shot
-- Damage distributed to body parts: head, body, leg
-- Player dies when cumulative damage ≥ max health
-
-**Spike Mechanics:**
-- Spike planted: 70% probability if attackers reach site
-- Spike defuse time: 40 seconds from plant
-- Spike detonation: ~45 seconds from plant
-- Defenders have window to defuse before detonation
-
-**Round Duration:**
-- **No spike**: 80-100 seconds (timer expires)
-- **Spike detonated**: 20-100s (to plant) + 35-45s (fuse) = up to 145s
-- **Spike defused**: 20-90s (to plant) + 5-35s (to defuse) = up to 140s
-
-**Round Win Condition:**
-- All enemies eliminated, OR
-- Spike planted & detonated (attackers win), OR
-- Spike defused before detonation (defenders win), OR
-- Timer expires (defender win if spike not planted)
+Every model carries dbt tests — `unique`, `not_null`, `relationships`, and `accepted_values` (e.g. `result ∈ {win, loss}`, `is_win ∈ {0,1}`, `side ∈ {attacker, defender}`). A full `dbt build` runs **24 models and 63 tests (87 nodes)**, all passing.
 
 ---
 
-## Installation
+## Quickstart
 
 ### Prerequisites
-- Python 3.8+
-- pip package manager
+- Python 3.10+ and `pip`
+- Docker Desktop (for PostgreSQL)
 
-### Steps
+### 1. Install Python dependencies
+```bash
+pip install -r requirements.txt
+```
 
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd ValorantAnalysis
-   ```
+### 2. Configure environment
+```bash
+cp .env.example .env      # adjust credentials if you like; defaults work out of the box
+```
 
-2. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
+### 3. Start PostgreSQL
+```bash
+docker compose up -d
+```
+This launches PostgreSQL 16 (`valorant_postgres`) on `localhost:5432` with a persistent named volume.
 
-3. **Create data directory**
-   ```bash
-   mkdir -p data
-   ```
-
-4. **Verify installation**
-   ```bash
-   python -c "import pandas; import requests; print('All dependencies installed!')"
-   ```
-
----
-
-## Usage
-
-### 1. Fetch Valorant API Data
-
+### 4. Run the pipeline (extract → simulate → load into `raw`)
 ```bash
 python main.py
 ```
 
-**Output**: Generates CSV files in `data/` directory
-- `agents_dim.csv`
-- `weapons_dim.csv`
-- `maps_dim.csv`
-- `gamemodes_dim.csv`
-- `gears_dim.csv`
-- `competitive_tiers_dim.csv`
-- `users_dim.csv`
+### 5. Set up dbt in an isolated venv
+```bash
+python -m venv dbt_venv
+dbt_venv/Scripts/pip install dbt-core dbt-postgres   # Windows
+# dbt_venv/bin/pip install dbt-core dbt-postgres     # macOS/Linux
+```
 
-### 2. Generate Match Timeline Simulations
+### 6. Build the warehouse models
+```bash
+cd valorant_dbt
+../dbt_venv/Scripts/dbt.exe build --profiles-dir .   # Windows
+# ../dbt_venv/bin/dbt build --profiles-dir .         # macOS/Linux
+```
+
+### 7. (Optional) Generate & serve docs
+```bash
+../dbt_venv/Scripts/dbt.exe docs generate --profiles-dir .
+../dbt_venv/Scripts/dbt.exe docs serve --profiles-dir .
+```
+
+After step 6 you'll have `raw` (15 tables), `staging` (15 views), and `marts` (9 tables) populated and tested.
+
+---
+
+## Pipeline Details
+
+`main.py` orchestrates the run in three functions:
+
+- **`build_dimension_data()`** — calls the Valorant API client, transforms each JSON response to a DataFrame, generates synthetic users, and writes 7 dimension CSVs.
+- **`build_fact_data()`** — reads the dimension CSVs and runs `generate_all_match_details()`, which simulates matches chronologically: it matchmakes by each player's live rank, simulates the match, then updates ranks before forming the next lobby. Writes 8 fact CSVs (including `match_summary`, `rank_history`, and `weapon_economy`).
+- **`main()`** — runs both, then `load_all({**dimensions, **facts})` to push every DataFrame into the Postgres `raw` schema.
+
+The loader (`postgres_loader.py`) builds a SQLAlchemy engine from env vars, ensures the target schema exists, and uses `pandas.to_sql(method="multi")` with a dynamic chunk size that respects Postgres' 65,535 bind-parameter limit. NaNs land as SQL `NULL`.
+
+---
+
+## Simulation Logic
+
+Since the Valorant API exposes only metadata (not real match telemetry), match data is **synthetically simulated** to be statistically realistic.
+
+### Match level
+- 10 unique players per match, split into 2 teams of 5, on a randomly selected map.
+
+### Round level (up to 25 rounds)
+- **Rounds 1–12:** Team A attacks; **Round 13:** sides swap; **Rounds 14+:** Team B attacks.
+- Match ends when a team reaches 13 round wins.
+
+### Event level (per round)
+- **Damage model:** each player has 250 HP; per-shot damage (0–255) is split across head / body / leg; a player dies when cumulative damage ≥ max health.
+- **Spike mechanics:** ~70% plant probability when attackers reach a site; ~40s defuse window, ~45s detonation timer.
+- **Round duration:** no spike → 80–100s (timer); detonated → up to ~145s; defused → up to ~140s.
+- **Win condition:** all enemies eliminated, spike detonated (attackers), spike defused (defenders), or timer expiry (defenders if no plant).
+
+### Matchmaking
+Lobbies are formed by each player's **live rank tier**, so matches stay competitive as players climb. Players are grouped by *rank family* (IRON, BRONZE, SILVER, …, ignoring the 1/2/3 sub-rank). All 10 players in a lobby must fall within **3 consecutive rank families**; a 4-family span is allowed only when the lowest family present is **UNRANKED** (new players act as a wildcard floor). Early in a player's history everyone is UNRANKED, so the constraint is unbound until ranks diverge.
+
+### Rank progression
+Rank movement is interleaved with simulation: after each match, every player's rank and rating points are updated from the match outcome (result, round margin, and combat score relative to team average), producing `rank_history` (per player, per match: `rank_before/after`, `points_before/after`, `radiant_delta`, `result`). Each tier holds 100 points — crossing 100 promotes, dropping below 0 demotes. Every player starts **UNRANKED** and climbs from there, and the updated rank immediately feeds the next match's matchmaking.
+
+### Credit economy & loadouts
+Each round, every player runs a sequential **buy → settle** credit cycle, producing `weapon_economy` (one row per player per round, 24 columns: starting/ending credits, sidearm/secondary/gear choices and their costs, total spend, kills, survival, round outcome, credits earned, and the loss-bonus streak).
+
+- **Loadout:** one **sidearm** + one **secondary** (a non-sidearm gun: SMG / Shotgun / Rifle / Sniper / Heavy) + one **gear** (armor). Buys are constrained to what the player can afford — spend never exceeds the wallet.
+- **Buy phase:** the free **Classic** is the default sidearm; players probabilistically upgrade their sidearm, buy a secondary, and buy armor when affordable.
+- **Pistol & reset rounds:** round 1 and the halftime round (round 13) reset every player to **800** credits — the classic pistol-round economy. *(Overtime's 5,000-credit reset is not yet modeled — see Roadmap.)*
+- **Round earnings:** round win **+3000**; loss bonus escalates on a streak (**1900 → 2400 → 2900**); a save penalty caps a surviving loss at **1000**; **+200 per kill**; **+300 spike-plant bonus** to attackers. Wallet is capped at **6500**.
+- **Weapon costs** live in `weapons_dim` (`category`, `cost`) and gear costs in `gears_dim`, both sourced from the Valorant API's `shopData` and normalized to a canonical buy-menu spec in the transformer:
+
+  | Category | Weapons (cost) |
+  |----------|----------------|
+  | Sidearm  | Classic 0 · Shorty 300 · Frenzy 450 · Ghost 500 · Bandit 600 · Sheriff 800 |
+  | SMG      | Stinger 1100 · Spectre 1600 |
+  | Shotgun  | Bucky 850 · Judge 1850 |
+  | Rifle    | Bulldog 2050 · Guardian 2250 · Phantom 2900 · Vandal 2900 |
+  | Sniper   | Marshal 950 · Outlaw 2400 · Operator 4700 |
+  | Heavy    | Ares 1550 · Odin 3250 |
+  | Gear     | Light Armor 400 · Regen Shield 650 · Heavy Armor 1000 |
+
+---
+
+## Testing
+
+The warehouse loader has a pytest integration suite (`tests/test_postgres_loader.py`):
 
 ```bash
-python -m source.components.matchTimeline
+python -m pytest
 ```
 
-**Configuration** (in `matchTimeline.py`'s `__main__` block):
-- Customize date range: `start_date`, `end_date`
-- Adjust matches per day: `per_day_match_counter`
-- Modify round count: `total_rounds` (default: 25)
+It uses a throwaway `loader_test` schema and **skips gracefully** if Postgres is unreachable, so it never fails on a machine without the container running. Coverage includes connectivity, schema idempotency, load round-trips, NaN→NULL handling, `replace` idempotency, and per-dimension row-count checks.
 
-**Output**: Generates match analysis CSVs
-- `match_status.csv` - Match-level results (wins/losses)
-- `round_status.csv` - Per-round statistics and durations
-- `agent_perf_status.csv` - Individual player performance metrics
-- `round_spike_status.csv` - Spike plant/defuse events
-
-### 3. Python API Usage
-
-```python
-from source.components.matchTimeline import generate_all_match_details
-import pandas as pd
-
-# Load base data
-users_df = pd.read_csv("data/users_dim.csv", parse_dates=["join_date"])
-agents_df = pd.read_csv("data/agents_dim.csv")
-maps_df = pd.read_csv("data/maps_dim.csv")
-
-# Generate matches
-match_status, round_status, agent_perf_status, round_spike_status, match_df = \
-    generate_all_match_details(
-        users_df=users_df,
-        agents_df=agents_df,
-        maps_df=maps_df,
-        per_day_match_counter=2,  # 2 matches per day
-        start_date="2025-01-01",
-        end_date="2025-12-31"
-    )
-
-# Analyze results
-print(f"Generated {len(match_status)} matches")
-print(f"Total rounds: {len(round_status)}")
-print(f"Agent performances recorded: {len(agent_perf_status)}")
-```
-
----
-
-## Data Output
-
-### match_status.csv
-| Column | Description |
-|--------|-------------|
-| match_id | Unique match identifier |
-| attacker_round_wins | Number of rounds won by attackers |
-| defender_round_wins | Number of rounds won by defenders |
-
-### round_status.csv
-| Column | Description |
-|--------|-------------|
-| match_id | Parent match identifier |
-| round_id | Unique round identifier (e.g., MATCH_000001-R01) |
-| total_round_duration | Duration of round in seconds |
-
-### agent_perf_status.csv
-| Column | Description |
-|--------|-------------|
-| match_id | Parent match identifier |
-| round_id | Parent round identifier |
-| agent_name | Player/agent name |
-| isAttacker | 1 if agent was attacker, 0 if defender |
-| isDefender | 1 if agent was defender, 0 if attacker |
-| opponent | Enemy agent name |
-| head_hit | Head shots landed |
-| body_hit | Body shots landed |
-| leg_hit | Leg shots landed |
-| head_damage | Head damage dealt |
-| body_damage | Body damage dealt |
-| leg_damage | Leg damage dealt |
-
-### round_spike_status.csv
-| Column | Description |
-|--------|-------------|
-| match_id | Parent match identifier |
-| round_id | Parent round identifier |
-| spike_planted | 1 if spike was planted, 0 otherwise |
-| spike_defused | 1 if spike was defused, 0 otherwise |
-
----
-
-## Future Data Output Tables
-
-The following tables will be generated in upcoming phases:
-
-### weapon_usage.csv (Phase 2) 🚧
-Weapon selection and usage statistics per player per round
-
-| Column | Description |
-|--------|-------------|
-| match_id | Parent match identifier |
-| round_id | Parent round identifier |
-| agent_name | Player/agent name |
-| primary_weapon | Primary weapon selected for round |
-| secondary_weapon | Secondary weapon selected for round |
-| armor_level | Armor purchased (0/200/400) |
-| weapon_kills | Kills with primary weapon |
-| utility_used | Utility abilities used |
-
-### economy_state.csv (Phase 2) 🚧
-Round-by-round economy information
-
-| Column | Description |
-|--------|-------------|
-| match_id | Parent match identifier |
-| round_id | Parent round identifier |
-| team | Team identifier |
-| total_credits | Total team credits available |
-| economy_state | Buy state (full_buy, eco, half_buy, pistol) |
-| spent_credits | Total credits spent this round |
-| credit_deficit | Credit shortage (if any) |
-
-### match_summary.csv (Phase 3) 🚧
-High-level match summary and statistics
-
-| Column | Description |
-|--------|-------------|
-| match_id | Unique match identifier |
-| winning_team | Team that won the match |
-| final_score | Final round score (e.g., "13-5") |
-| mvp | Most Valuable Player (agent_name) |
-| average_match_duration | Total match time in seconds |
-| combat_duration | Total combat time (excluding downtime) |
-| total_kills | Total elimination count across all players |
-| total_plants | Total spike plants in match |
-
-### player_progression.csv (Phase 3) 🚧
-Player rank progression and rating changes
-
-| Column | Description |
-|--------|-------------|
-| match_id | Parent match identifier |
-| agent_name | Player/agent name |
-| starting_rank | Rank before match |
-| ending_rank | Rank after match |
-| rr_gain | Rating rating points gained/lost |
-| performance_score | Overall performance rating |
-| individual_impact | Player's impact on match outcome |
-
-### player_matchup_history.csv (Phase 4) 🚧
-Historical head-to-head matchup statistics
-
-| Column | Description |
-|--------|-------------|
-| player1 | First player identifier |
-| player2 | Second player identifier |
-| total_encounters | Times these players faced each other |
-| player1_wins | Encounters won by player1 |
-| player2_wins | Encounters won by player2 |
-| average_rating_diff | Average rating difference |
+dbt provides the warehouse-side tests — run `dbt test` (or `dbt build`) to validate keys, referential integrity, and accepted values across all models.
 
 ---
 
 ## Configuration
 
-### Logging
+All warehouse settings come from environment variables (see `.env.example`):
 
-Logging is configured in `source/logger.py`. Logs capture:
-- **INFO**: Major operations (match creation, file generation)
-- **DEBUG**: Detailed flow (round processing, team assignments)
-- **ERROR**: Exceptions and failures
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `POSTGRES_USER` | `valorant` | DB user |
+| `POSTGRES_PASSWORD` | `valorant` | DB password (dev only) |
+| `POSTGRES_DB` | `valorant` | Database name |
+| `POSTGRES_HOST` | `localhost` | Host |
+| `POSTGRES_PORT` | `5432` | Port |
+| `RAW_SCHEMA` | `raw` | Target schema for the loader |
 
-Check the application logs to debug issues or understand execution flow.
-
-### API Rate Limiting
-
-The Valorant API may have rate limits. If experiencing API errors:
-1. Check your internet connection
-2. Wait before retrying
-3. Consider caching API responses for repeated runs
-
-### Customization
-
-**To modify match generation logic:**
-- Edit functions in `source/components/matchTimeline.py`
-- Adjust probability distributions in event simulation
-- Modify team size, rounds per match, etc.
-
-**To add new data sources:**
-- Create new transformer in `source/components/jsonToPdTransformer/`
-- Add API client method in `source/components/apiClient/`
-- Update `main.py` to include new data
+`.env` is gitignored — only the example template is committed. The defaults are throwaway credentials for a local Docker instance; change them for any non-local use. dbt reads the same variables via `env_var(...)` in `valorant_dbt/profiles.yml`.
 
 ---
 
@@ -566,157 +280,32 @@ The Valorant API may have rate limits. If experiencing API errors:
 
 | Issue | Solution |
 |-------|----------|
-| `ModuleNotFoundError` | Run `pip install -e .` to install package in editable mode |
-| API connection error | Check internet, verify Valorant API is accessible |
-| InvalidIndexError | Occurs with non-aligned DataFrame indices - update to latest version |
-| Memory error with large datasets | Process matches in smaller batches, increase available RAM |
+| `ModuleNotFoundError` on `source.*` | Run `pip install -e .` to install the package in editable mode |
+| Loader / dbt can't connect to Postgres | Ensure `docker compose up -d` is running and `.env` matches `docker-compose.yml` |
+| dbt error: *adapter "postgres" not found* | You're using **dbt-fusion**. Install `dbt-postgres` in an isolated venv and invoke that binary (see [Quickstart](#quickstart)) |
+| dbt: `column "..." does not exist` | Postgres folds unquoted identifiers to lowercase — mixed-case source columns must be double-quoted in staging models |
+| dbt: `function round(double precision, integer) does not exist` | Cast the expression to `::numeric` before `round()` |
+| dbt: `cannot cast type integer to boolean` | Use `(col = 1)` instead of `cast(col as boolean)` |
+| pytest skips all tests | Expected when Postgres is down — start the container to run them |
 
 ---
 
 ## Roadmap
 
-### Phase 1: Core Foundation ✅ (Current)
-- [x] Valorant API integration
-- [x] Match data generation
-- [x] Basic round simulation (25 rounds)
-- [x] Team assignment and side mechanics
-- [x] Kill/death event simulation
-- [x] Spike plant/defuse logic
-- [x] Player performance metrics
-- [x] Comprehensive logging
+### ✅ Done
+- **Simulation engine** — match timelines, damage/spike mechanics, per-agent performance, match summaries, and rank progression
+- **Phase 1 — Data Warehouse** — Dockerized PostgreSQL + Python loader, integrated into `main.py`, with a pytest integration suite
+- **Phase 2 — dbt** — sources, 15 staging views, star-schema marts (dims + `fct_player_match`), 5 analytical marts, and 87 passing nodes
+- **Credit economy** — per-round buy/settle credit cycle, weapon & gear costs, loadout selection, loss-bonus streaks, and the `weapon_economy` fact + `mart_player_economy`
 
-### Phase 2: Economy & Weapons 🚧 (In Progress)
-- [ ] **Weapon Economy System**
-  - Implement credit system per round (starting credits: 800)
-  - Track team economy state (full buy, eco, half-buy)
-  - Implement reset mechanics
-  
-- [ ] **Weapon Selection Logic**
-  - Assign weapons to players based on economy
-  - Implement weapon choice algorithms
-  - Track weapon usage statistics
-  - Generate weapon_usage.csv output
-  
-- [ ] **Damage Model Enhancement**
-  - Implement armor/shield mechanics
-  - Body part-specific damage multipliers (head 1.25x, leg 0.75x)
-  - Weapon-specific damage profiles
-  - Range-based damage falloff
-
-### Phase 3: Advanced Game Mechanics 📋 (Planned)
-- [ ] **Match Summary Logic**
-  - Aggregate match statistics
-  - Calculate impact scores per player
-  - Determine MVP (Most Valuable Player)
-  - Generate match_summary.csv output
-
-- [ ] **Player Progression System**
-  - Track rank progression within matches
-  - Implement RR (Rating Rating) gain/loss logic
-  - Handle rank tier advancement/demotion
-  - Generate player_progression.csv output
-
-- [ ] **Ability & Agent Selection**
-  - Integrate agent abilities into damage calculations
-  - Implement ability cooldowns and charges
-  - Track ability usage per round
-
-### Phase 4: Matchmaking & Ranking 🎯 (Planned)
-- [ ] **Rank-Based Matching**
-  - Implement matchmaking algorithm by rank tier
-  - Balance team compositions by average rank
-  - Generate team balance metrics
-  
-- [ ] **Skill Rating System**
-  - Implement true skill or Elo-based ranking
-  - Track historical player ratings
-  - Generate ranking progression reports
-
-### Phase 5: Analytics & Output 📊 (Planned)
-- [ ] **Enhanced Data Output**
-  - Economy statistics per team/player
-  - Weapon usage heatmaps
-  - Position-based kill statistics
-  - Round economy decisions and outcomes
-  - Rank progression tracking
-  - Player matchup history
-  
-- [ ] **Report Generation**
-  - Automated match reports with summaries
-  - Performance trend analysis
-  - Player comparison reports
-  - Meta analysis dashboards
-
-### Phase 6: ML & Modeling 🤖 (Planned)
-- [ ] **Training Data Preparation**
-  - Feature engineering for ML models
-  - Balanced dataset generation
-  - Cross-validation split utilities
-  
-- [ ] **Reference Models**
-  - Win probability predictor
-  - Player PPA (Performance Per Agent) estimator
-  - Rank progression forecaster
-  - Economic state impact analyzer
+### 🚧 Next
+- **BI / serving layer** — dashboards on the marts (Metabase, Streamlit, or similar)
+- **Orchestration** — schedule the end-to-end run (e.g. with Airflow / Dagster / cron)
+- **Economy & damage model extensions** — overtime (5,000-credit) reset, in-round weapon switches, armor/shield and body-part damage multipliers
+- **ML** — win-probability and rank-progression models built on the marts
 
 ---
 
 ## License
 
-This project is provided as-is for educational and analytical purposes.
-
----
-
-## Contributing
-
-To contribute to the project:
-
-### Getting Started
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/description`
-3. Implement your changes following the architecture guidelines
-4. Test thoroughly: `python -m pytest`
-5. Commit with clear, descriptive messages
-6. Push to your branch and create a Pull Request
-
-### Development Areas Seeking Contributions
-
-#### 🎯 Priority Areas
-- **Weapon Economy System**: Implement credit tracking and buy state logic
-- **Advanced Damage Mechanics**: Add armor effects, damage multipliers per body part
-- **Match Summary Generation**: Aggregate statistics and MVP determination
-- **Rank Progression**: Build tier advancement and RR calculation
-
-#### 💡 Contribution Guidelines
-- Follow the existing code structure and naming conventions
-- Add comprehensive logging using `source.logger`
-- Include error handling with `CustomException`
-- Write unit tests for new functions
-- Update the README with new features/data outputs
-- Maintain data integrity with `.reset_index(drop=True)` operations
-
-#### 📋 Code Standards
-- Use type hints in function signatures
-- Document functions with docstrings
-- Keep functions focused on single responsibilities
-- Add logging at INFO level for major operations, DEBUG for detailed flow
-- Handle edge cases (empty DataFrames, missing columns, etc.)
-
-#### 🔄 Testing Before PR
-```bash
-# Run basic imports
-python -c "from source.components.matchTimeline import generate_all_match_details"
-
-# Test end-to-end
-python test_reindex_fix.py
-
-# Check for syntax errors
-python -m py_compile source/components/matchTimeline.py
-```
-
-#### 📝 Documentation
-When adding new features, update:
-- This README with feature description and usage
-- Function docstrings with parameters and return values
-- Logging messages to guide debugging
-- Data Output section with new CSV schema
+Provided as-is for educational and portfolio purposes.

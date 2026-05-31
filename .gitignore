@@ -8,6 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+data/
 build/
 develop-eggs/
 dist/
@@ -133,6 +134,16 @@ celerybeat.pid
 
 # SageMath parsed files
 *.sage.py
+
+# dbt
+valorant_dbt/target/
+valorant_dbt/dbt_packages/
+valorant_dbt/logs/
+valorant_dbt/.user.yml
+dbt_venv/
+
+# Claude Code local state
+.claude/
 
 # Environments
 .env

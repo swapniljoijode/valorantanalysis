@@ -1,0 +1,73 @@
+version: 2
+
+models:
+  - name: dim_players
+    description: "Player dimension with starting rank tier."
+    columns:
+      - name: user_id
+        tests: [unique, not_null]
+
+  - name: dim_agents
+    description: "Agent dimension."
+    columns:
+      - name: agent_id
+        tests: [unique, not_null]
+      - name: agent_name
+        tests: [unique, not_null]
+
+  - name: dim_maps
+    description: "Map dimension."
+    columns:
+      - name: map_id
+        tests: [unique, not_null]
+
+  - name: fct_player_match
+    description: "Player-match fact. One row per player per match."
+    columns:
+      - name: match_player_id
+        tests: [unique, not_null]
+      - name: user_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_players')
+              field: user_id
+      - name: is_win
+        tests:
+          - accepted_values:
+              values: [0, 1]
+              quote: false
+
+  - name: mart_player_performance
+    description: "Per-player career performance summary."
+    columns:
+      - name: user_id
+        tests: [unique, not_null]
+      - name: win_rate
+        tests: [not_null]
+
+  - name: mart_agent_pickrate
+    description: "Agent pick rate and effectiveness."
+    columns:
+      - name: agent_name
+        tests: [unique, not_null]
+
+  - name: mart_map_winrate
+    description: "Per-map activity and side balance."
+    columns:
+      - name: map_id
+        tests: [unique, not_null]
+
+  - name: mart_rank_distribution
+    description: "Distribution of players across their current rank."
+    columns:
+      - name: current_rank
+        tests: [unique, not_null]
+
+  - name: mart_player_economy
+    description: "Per-player credit-economy summary across all rounds played."
+    columns:
+      - name: user_id
+        tests: [unique, not_null]
+      - name: rounds_played
+        tests: [not_null]

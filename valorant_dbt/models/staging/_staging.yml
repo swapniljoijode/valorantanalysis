@@ -1,0 +1,132 @@
+version: 2
+
+models:
+  - name: stg_agents
+    description: "One row per Valorant agent."
+    columns:
+      - name: agent_id
+        tests: [unique, not_null]
+      - name: agent_name
+        tests: [not_null]
+
+  - name: stg_maps
+    description: "One row per map."
+    columns:
+      - name: map_id
+        tests: [unique, not_null]
+      - name: map_name
+        tests: [not_null]
+
+  - name: stg_weapons
+    description: "One row per weapon with core handling specs."
+    columns:
+      - name: weapon_id
+        tests: [unique, not_null]
+
+  - name: stg_competitive_tiers
+    description: "Competitive rank tiers (keyed on rank name; uuid is episode-level)."
+    columns:
+      - name: rank_name
+        tests: [unique, not_null]
+
+  - name: stg_gears
+    description: "Purchasable armor/gear."
+    columns:
+      - name: gear_id
+        tests: [unique, not_null]
+
+  - name: stg_gamemodes
+    description: "Game modes."
+    columns:
+      - name: gamemode_id
+        tests: [unique, not_null]
+
+  - name: stg_users
+    description: "Synthetic players."
+    columns:
+      - name: user_id
+        tests: [unique, not_null]
+
+  - name: stg_matches
+    description: "Player participation in a match (grain: match_id + user_id)."
+    columns:
+      - name: match_id
+        tests: [not_null]
+      - name: user_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_users')
+              field: user_id
+      - name: map_id
+        tests:
+          - relationships:
+              to: ref('stg_maps')
+              field: map_id
+      - name: agent_name
+        tests:
+          - relationships:
+              to: ref('stg_agents')
+              field: agent_name
+
+  - name: stg_match_status
+    description: "Per-match attacker/defender round-win totals."
+    columns:
+      - name: match_id
+        tests: [unique, not_null]
+
+  - name: stg_match_summary
+    description: "Per-match-per-agent aggregated combat stats."
+    columns:
+      - name: match_id
+        tests: [not_null]
+      - name: agent_name
+        tests: [not_null]
+
+  - name: stg_rank_history
+    description: "Per-player rank movement after each match."
+    columns:
+      - name: match_id
+        tests: [not_null]
+      - name: user_id
+        tests: [not_null]
+      - name: result
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['win', 'loss']
+
+  - name: stg_round_status
+    description: "Per-round duration."
+    columns:
+      - name: round_id
+        tests: [not_null]
+
+  - name: stg_round_spike_status
+    description: "Per-round spike plant/defuse flags."
+    columns:
+      - name: round_id
+        tests: [not_null]
+
+  - name: stg_agent_perf
+    description: "Per-round agent-vs-opponent damage and kill/death detail."
+    columns:
+      - name: match_id
+        tests: [not_null]
+      - name: agent_name
+        tests: [not_null]
+
+  - name: stg_weapon_economy
+    description: "Per-player, per-round credit economy and weapon/gear loadout."
+    columns:
+      - name: match_id
+        tests: [not_null]
+      - name: round_id
+        tests: [not_null]
+      - name: user_id
+        tests: [not_null]
+      - name: side
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['attacker', 'defender']

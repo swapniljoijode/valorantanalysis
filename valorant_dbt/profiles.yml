@@ -1,0 +1,12 @@
+valorant_dbt:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('POSTGRES_HOST', 'localhost') }}"
+      port: 5432
+      user: "{{ env_var('POSTGRES_USER', 'valorant') }}"
+      password: "{{ env_var('POSTGRES_PASSWORD', 'valorant') }}"
+      dbname: "{{ env_var('POSTGRES_DB', 'valorant') }}"
+      schema: analytics
+      threads: 4

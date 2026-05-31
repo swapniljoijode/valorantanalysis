@@ -1,0 +1,22 @@
+version: 2
+
+sources:
+  - name: raw
+    description: "Raw landing tables loaded from the Python pipeline (Phase 1)."
+    schema: raw
+    tables:
+      - name: agents_dim
+      - name: maps_dim
+      - name: weapons_dim
+      - name: competitive_tiers_dim
+      - name: gears_dim
+      - name: gamemodes_dim
+      - name: users_dim
+      - name: match_df
+      - name: match_status
+      - name: match_summary
+      - name: rank_history
+      - name: round_status
+      - name: round_spike_status
+      - name: agent_perf_status
+      - name: weapon_economy

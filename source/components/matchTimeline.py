@@ -10,10 +10,199 @@ from source.logger import logging
 
 #generating match timeline initial data
 
+# Tier families in ascending skill order. Each family covers its sub-ranks
+# (e.g. IRON 1/2/3); UNRANKED and RADIANT are single-rank families.
+RANK_FAMILIES = [
+    "UNRANKED", "IRON", "BRONZE", "SILVER", "GOLD",
+    "PLATINUM", "DIAMOND", "ASCENDANT", "IMMORTAL", "RADIANT",
+]
+_FAMILY_INDEX = {fam: i for i, fam in enumerate(RANK_FAMILIES)}
+
+
+def family_index(rank_name: str) -> int:
+    """Map a rank name (e.g. 'IRON 2', 'UNRANKED', 'RADIANT') to its family index."""
+    return _FAMILY_INDEX[str(rank_name).split()[0].upper()]
+
+
+def tier_matchmake(
+    eligible_users: pd.DataFrame,
+    rank_states: Dict[int, dict],
+    competitive_tiers: List[str],
+    n_players: int = 10,
+) -> pd.DataFrame:
+    """
+    Pick n_players for a match so they all fall inside a window of 3 consecutive
+    rank families (4 families only when the window floor is UNRANKED, which acts
+    as a wildcard entry tier). An anchor player is chosen at random, a family
+    window containing them is selected, and the rest are sampled from players in
+    that window. If a window holds fewer than n_players, it is widened until
+    enough candidates exist. Caller guarantees len(eligible_users) >= n_players.
+    """
+    users = eligible_users.reset_index(drop=True)
+    max_fam = len(RANK_FAMILIES) - 1
+
+    # Current family for every eligible player, from their live rank state.
+    fam = users["user_id"].map(
+        lambda uid: family_index(competitive_tiers[rank_states[uid]["rank_index"]])
+    ).to_numpy()
+
+    # 1) Random anchor and a 3-family window that contains them.
+    anchor_pos = int(np.random.randint(0, len(users)))
+    anchor_fam = int(fam[anchor_pos])
+    lo_choices = [c for c in (anchor_fam - 2, anchor_fam - 1, anchor_fam)
+                  if c >= 0 and c + 2 <= max_fam]
+    if not lo_choices:
+        lo_choices = [max(0, min(anchor_fam, max_fam - 2))]
+    lo = int(np.random.choice(lo_choices))
+    hi = lo + 2
+    # UNRANKED wildcard: a window anchored at the floor may span one extra family.
+    if lo == 0:
+        hi = min(lo + 3, max_fam)
+
+    # 2) Candidate pool inside the window; widen symmetrically if too few.
+    mask = (fam >= lo) & (fam <= hi)
+    while mask.sum() < n_players and (lo > 0 or hi < max_fam):
+        lo = max(0, lo - 1)
+        hi = min(max_fam, hi + 1)
+        mask = (fam >= lo) & (fam <= hi)
+
+    candidate_idx = np.flatnonzero(mask)
+
+    # 3) Keep the anchor, sample the remaining slots from the window.
+    others = candidate_idx[candidate_idx != anchor_pos]
+    picked = np.random.choice(others, size=n_players - 1, replace=False)
+    chosen = np.concatenate([[anchor_pos], picked])
+    return users.iloc[chosen].reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Credit economy + weapon selection
+# ---------------------------------------------------------------------------
+# Each player carries at most three items: one sidearm (the free Classic by
+# default), one "secondary" from the heavier categories, and one piece of gear.
+# Credits are earned from round outcomes and spent in the next buy phase. The
+# wallet is hard-capped at MAX_CREDITS and reset to PISTOL_CREDITS on the two
+# pistol rounds (match start, halftime). See build_round_economy for the loop.
+
+MAX_CREDITS = 6500          # hard wallet ceiling
+PISTOL_CREDITS = 800        # reset amount on pistol rounds (round 1 and 13)
+DEFAULT_SIDEARM = "Classic"  # free fallback pistol
+SECONDARY_CATEGORIES = {"SMG", "Shotgun", "Rifle", "Sniper", "Heavy"}
+
+
+def build_weapon_pools(weapons_df: pd.DataFrame, gears_df: pd.DataFrame):
+    """Split the weapon/gear dimension tables into purchasable pools.
+
+    Returns (sidearms, secondaries, gears) where each pool is a list of
+    (name, cost) tuples. Melee and any rows without a cost are excluded.
+    """
+    w = weapons_df.dropna(subset=["category", "cost"]).copy()
+    w["cost"] = w["cost"].astype(int)
+    sidearms = [(r["name"], int(r["cost"]))
+                for _, r in w[w["category"] == "Sidearm"].iterrows()]
+    secondaries = [(r["name"], int(r["cost"]))
+                   for _, r in w[w["category"].isin(SECONDARY_CATEGORIES)].iterrows()]
+    gears = [(r["name"], int(r["cost"]))
+             for _, r in gears_df.dropna(subset=["cost"]).iterrows()]
+    # Guarantee the free fallback pistol always exists.
+    if not any(name == DEFAULT_SIDEARM for name, _ in sidearms):
+        sidearms.append((DEFAULT_SIDEARM, 0))
+    return sidearms, secondaries, gears
+
+
+def buy_loadout(
+    budget: int,
+    sidearms: list,
+    secondaries: list,
+    gears: list,
+    p_upgrade_sidearm: float = 0.4,
+    p_secondary: float = 0.8,
+    p_gear: float = 0.8,
+):
+    """Randomly assemble a loadout whose total cost never exceeds `budget`.
+
+    Always keeps the free Classic as a baseline sidearm, then randomly tries to
+    upgrade the sidearm, add a secondary weapon, and add gear - each only if it
+    is still affordable from the remaining budget. Returns a dict of names,
+    costs and the total spend.
+    """
+    remaining = int(budget)
+
+    # Sidearm: default to the free Classic, occasionally upgrade if affordable.
+    sidearm_name, sidearm_cost = DEFAULT_SIDEARM, 0
+    if np.random.random() < p_upgrade_sidearm:
+        affordable = [s for s in sidearms if s[1] <= remaining]
+        if affordable:
+            sidearm_name, sidearm_cost = affordable[np.random.randint(len(affordable))]
+    remaining -= sidearm_cost
+
+    # Secondary weapon (optional).
+    secondary_name, secondary_cost = "", 0
+    if np.random.random() < p_secondary:
+        affordable = [s for s in secondaries if s[1] <= remaining]
+        if affordable:
+            secondary_name, secondary_cost = affordable[np.random.randint(len(affordable))]
+            remaining -= secondary_cost
+
+    # Gear (optional).
+    gear_name, gear_cost = "", 0
+    if np.random.random() < p_gear:
+        affordable = [g for g in gears if g[1] <= remaining]
+        if affordable:
+            gear_name, gear_cost = affordable[np.random.randint(len(affordable))]
+            remaining -= gear_cost
+
+    spend = int(budget) - remaining
+    return {
+        "sidearm": sidearm_name, "sidearm_cost": sidearm_cost,
+        "secondary": secondary_name, "secondary_cost": secondary_cost,
+        "gear": gear_name, "gear_cost": gear_cost,
+        "spend": spend,
+    }
+
+
+def round_earnings(
+    side: str,
+    won: bool,
+    survived: bool,
+    kills: int,
+    team_planted: bool,
+    spike_detonated: bool,
+    loss_streak: int,
+) -> int:
+    """Credits a player earns from a round, applied to the next buy phase.
+
+    Win: flat 3000. Loss: streak bonus 1900/2400/2900 (1st/2nd/3rd+ loss).
+    Save penalty: a survivor on the losing side gets a flat 1000 and no streak
+    bonus - defenders who survive a detonation, or attackers who survive a loss
+    without their team planting. Per-kill (+200 each) and the attacking-team
+    plant bonus (+300) stack on top.
+    """
+    kill_bonus = 200 * int(kills)
+    plant_bonus = 300 if (side == "attacker" and team_planted) else 0
+
+    if won:
+        return 3000 + kill_bonus + plant_bonus
+
+    # Loss: check the "save" survival penalty.
+    saved = (
+        (side == "defender" and survived and spike_detonated)
+        or (side == "attacker" and survived and not team_planted)
+    )
+    if saved:
+        base = 1000  # no consecutive-loss bonus
+    else:
+        base = {1: 1900, 2: 2400}.get(loss_streak, 2900)
+    return base + kill_bonus + plant_bonus
+
+
 def generate_all_match_details(
     users_df: pd.DataFrame,
     agents_df: pd.DataFrame,
     maps_df: pd.DataFrame,
+    competitive_tiers: List[str],
+    weapons_df: pd.DataFrame,
+    gears_df: pd.DataFrame,
     per_day_match_counter: int = 2,
     start_date: str = "2025-01-01",
     end_date: str = "today",
@@ -31,16 +220,37 @@ def generate_all_match_details(
         # Date handling
         start_dt = pd.to_datetime(start_date)
         end_dt = pd.to_datetime(end_date).normalize()
-        all_rows = []
         match_seq = 1  # incremental match id
 
-    # Pre-filter playable agents
+        # Pre-filter playable agents
         if "isPlayable" in agents_df.columns:
             playable_agents = agents_df[agents_df["isPlayable"] == True].copy()
         else:
             playable_agents = agents_df.copy()
 
         N_PLAYERS = 10
+        if len(playable_agents) < N_PLAYERS:
+            raise ValueError("Not enough playable agents to assign uniquely.")
+        if maps_df.empty:
+            raise ValueError("maps_df is empty.")
+
+        # Every player starts UNRANKED; ranks evolve match-by-match in the loop
+        # below so that matchmaking can read each player's live rank.
+        rank_states: Dict[int, dict] = {
+            uid: initial_rank_state() for uid in users_df["user_id"]
+        }
+
+        match_df = pd.DataFrame()
+        match_status_list = []
+        round_status_list = []
+        agent_perf_status_list = []
+        round_spike_status_list = []
+        match_summary_list = []
+        rank_history_rows = []
+        weapon_economy_list = []
+
+        # Purchasable weapon/gear pools, built once for the whole run.
+        sidearms, secondaries, gears = build_weapon_pools(weapons_df, gears_df)
 
         for date in pd.date_range(start=start_dt, end=end_dt):
 
@@ -51,123 +261,78 @@ def generate_all_match_details(
                 continue
 
             for _ in range(per_day_match_counter):
-                # ----------------------------
-                # 1. Sample 10 players
-                # ----------------------------
-                match_players = eligible_users.sample(
-                    n=N_PLAYERS, replace=False
-                ).reset_index(drop=True)
+                # 1. Tier-aware matchmaking using players' current ranks
+                match_players = tier_matchmake(
+                    eligible_users, rank_states, competitive_tiers, n_players=N_PLAYERS
+                )
 
-                # ----------------------------
-                # 2. Sample 10 agents
-                # ----------------------------
-                if len(playable_agents) < N_PLAYERS:
-                    raise ValueError("Not enough playable agents to assign uniquely.")
-
+                # 2. Assign 10 unique agents
                 agents_sample = playable_agents.sample(
                     n=N_PLAYERS, replace=False
                 ).reset_index(drop=True)
-
-                # Use your actual columns: adjust if they differ
-                # Common API columns: uuid, displayName
-                match_players["agent_id"]   = agents_sample["uuid"]
+                match_players["agent_id"]   = agents_sample["uuid"].values
                 match_players["agent_name"] = agents_sample.get(
                     "displayName", agents_sample.get("name", "")
-                )
+                ).values
 
-                # ----------------------------
-                # 3. Sample a map for the match
-                # ----------------------------
-                if maps_df.empty:
-                    raise ValueError("maps_df is empty.")
-
+                # 3. Assign a map
                 match_map = maps_df.sample(n=1).reset_index(drop=True)
                 match_players["map_id"]   = match_map.loc[0, "uuid"]
                 match_players["map_name"] = match_map.loc[0, "name"]
 
-                """# ----------------------------
-                # 4. Assign sides: 5 attackers, 5 defenders
-                # ----------------------------
-                attack_indices = np.random.choice(
-                    match_players.index, size=5, replace=False
-                )
-                match_players["is_attacker"] = 0
-                match_players.loc[attack_indices, "is_attacker"] = 1
-                match_players["is_defender"] = 1 - match_players["is_attacker"]"""
-
-                # ----------------------------
-                # 5. Add match metadata
-                # ----------------------------
+                # 4. Match metadata
                 match_id = f"MATCH_{match_seq:06d}"
                 match_players["match_id"]   = match_id
                 match_players["match_date"] = date.normalize()
-
-                all_rows.append(match_players)
-                logging.info(f"Created match {match_id} on {date.normalize()}")
                 match_seq += 1
 
-        if not all_rows:
+                # 5. Teams + per-round simulation for this match
+                match_data = team_division(match_players.reset_index(drop=True))
+                match_df = pd.concat([match_df, match_data], ignore_index=True)
+                (match_status_pm, round_status_pm, agent_perf_pm,
+                 round_spike_pm, match_summary_pm,
+                 weapon_economy_pm) = generating_full_match_details_per_round(
+                    match_df=match_data, agents_df=agents_df,
+                    weapons_df=weapons_df, gears_df=gears_df,
+                    sidearms=sidearms, secondaries=secondaries, gears=gears,
+                )
+
+                match_status_list.append(match_status_pm.reset_index(drop=True))
+                round_status_list.append(round_status_pm.reset_index(drop=True))
+                agent_perf_status_list.append(agent_perf_pm.reset_index(drop=True))
+                round_spike_status_list.append(round_spike_pm.reset_index(drop=True))
+                match_summary_list.append(match_summary_pm.reset_index(drop=True))
+                weapon_economy_list.append(weapon_economy_pm.reset_index(drop=True))
+
+                # 6. Update each player's rank immediately so the next match's
+                #    matchmaking sees the new standings.
+                rank_history_rows.extend(
+                    update_ranks_for_match(
+                        match_summary=match_summary_pm,
+                        match_df=match_data,
+                        match_status=match_status_pm,
+                        competitive_tiers=competitive_tiers,
+                        rank_states=rank_states,
+                    )
+                )
+                logging.info(f"Created and ranked match {match_id} on {date.normalize()}")
+
+        if not match_status_list:
             logging.warning("No match rows generated. Returning empty DataFrames.")
-            # Return 5 empty DataFrames if no data
-            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+            empty = pd.DataFrame()
+            return empty, empty, empty, empty, empty, empty, empty, empty
 
-        base_matches_df = pd.concat(all_rows, ignore_index=True)
-        logging.info(f"Concatenated {len(all_rows)} match rows with shape {base_matches_df.shape}")
+        match_status = pd.concat(match_status_list, ignore_index=True)
+        round_status = pd.concat(round_status_list, ignore_index=True)
+        agent_perf_status = pd.concat(agent_perf_status_list, ignore_index=True).reset_index(drop=True)
+        round_spike_status = pd.concat(round_spike_status_list, ignore_index=True)
+        match_summary_status = pd.concat(match_summary_list, ignore_index=True)
+        rank_history = pd.DataFrame(rank_history_rows)
+        weapon_economy = pd.concat(weapon_economy_list, ignore_index=True)
 
-        # Optional: enforce column order
-        cols_order = [
-            "match_id",
-            "match_date",
-            "user_id",
-            "agent_id",
-            "agent_name",
-            "map_id",
-            "map_name",
-            "join_date",   # from users_df
-            # other user columns (username, etc.) will follow
-        ]
-        base_matches_df = base_matches_df[
-            [c for c in cols_order if c in base_matches_df.columns] +
-            [c for c in base_matches_df.columns if c not in cols_order]
-        ]
-        logging.info(f"Basic Match details generated")
-
-        match_df = pd.DataFrame()
-        match_status_list = []
-        round_status_list = []
-        agent_perf_status_list = []
-        round_spike_status_list = []
-        match_summary_list = []
-        
-        for m_id in base_matches_df["match_id"].unique():
-            logging.debug(f"Processing match {m_id}")
-            match_data = base_matches_df[base_matches_df["match_id"] == m_id].reset_index(drop=True)
-            match_df = pd.concat([match_df, team_division(match_data)], ignore_index=True)
-            match_data_filtered = match_df[match_df["match_id"] == m_id].reset_index(drop=True)
-            match_status_per_match, round_status_per_match, agent_perf_status_per_match, round_spike_status_per_match, match_summary = generating_full_match_details_per_round(
-                match_df=match_data_filtered, agents_df=agents_df
-            )
-            match_status_list.append(match_status_per_match.reset_index(drop=True))
-            round_status_list.append(round_status_per_match.reset_index(drop=True))
-            agent_perf_status_list.append(agent_perf_status_per_match.reset_index(drop=True))
-            round_spike_status_list.append(round_spike_status_per_match.reset_index(drop=True))
-            match_summary_list.append(match_summary.reset_index(drop=True))
-            
-        
-        # Concatenate all results at once
-        match_status = pd.concat(match_status_list, ignore_index=True) if match_status_list else pd.DataFrame()
-        round_status = pd.concat(round_status_list, ignore_index=True) if round_status_list else pd.DataFrame()
-        agent_perf_status = pd.concat(agent_perf_status_list, ignore_index=True).reset_index(drop=True) if agent_perf_status_list else pd.DataFrame()
-        round_spike_status = pd.concat(round_spike_status_list, ignore_index=True) if round_spike_status_list else pd.DataFrame()
-        match_summary_status = pd.concat(match_summary_list,ignore_index=True) if match_summary_list else pd.DataFrame()
-
-        
-
-
-        
         logging.info(f"Successfully completed generate_all_match_details")
-        return match_status,round_status,agent_perf_status,round_spike_status, match_df, match_summary_status
-    
+        return match_status, round_status, agent_perf_status, round_spike_status, match_df, match_summary_status, rank_history, weapon_economy
+
     except CustomException as e:
         logging.error(f"CustomException in generate_all_match_details: {str(e)}")
         raise
@@ -234,12 +399,18 @@ def generating_full_match_details_per_round(
         first_round_credit: int = 800,
         attacker_round_wins: int = 0,
         defender_round_wins: int = 0,
+        weapons_df: pd.DataFrame = None,
+        gears_df: pd.DataFrame = None,
+        sidearms: list = None,
+        secondaries: list = None,
+        gears: list = None,
         match_duration: int = np.random.randint(1500, 2400) # Match duration between 25 to 40 minutes
         )-> pd.DataFrame:
     """
     For each match in match_df, generate full round details:
         - rounds_per_match rounds
         - for each round: winning side (attackers/defenders)
+        - per-player, per-round credit economy + weapon loadout (weapon_economy)
     """
     try:
         match_id = match_df['match_id'].iloc[0] if len(match_df) > 0 else "UNKNOWN"
@@ -250,6 +421,25 @@ def generating_full_match_details_per_round(
         round_spike_status = pd.DataFrame()
         agent_perf_status = pd.DataFrame()
         match_summary = pd.DataFrame()
+
+        # ----- Economy setup (per match) -----
+        # Build weapon/gear pools if the caller did not pass pre-built ones.
+        if sidearms is None or secondaries is None or gears is None:
+            sidearms, secondaries, gears = build_weapon_pools(weapons_df, gears_df)
+        # Fixed per-player attributes for this match.
+        agent_user = dict(zip(match_df["agent_name"], match_df["user_id"]))
+        agent_team = {r["agent_name"]: ("A" if r["team A"] == 1 else "B")
+                      for _, r in match_df.iterrows()}
+        agents_in_match = list(match_df["agent_name"])
+        # Running economy state per player + per-team consecutive-loss streak.
+        economy_state = {
+            a: {"wallet": 0, "sidearm": (DEFAULT_SIDEARM, 0),
+                "secondary": ("", 0), "gear": ("", 0), "died_prev": False}
+            for a in agents_in_match
+        }
+        loss_streak = {"A": 0, "B": 0}
+        economy_rows = []
+
         for i in range (1, total_rounds + 1):
             round_id = f"{match_df['match_id'].iloc[0]}-R{i:02d}"
             logging.debug(f"Processing round {i}/{total_rounds}: {round_id}")
@@ -259,7 +449,46 @@ def generating_full_match_details_per_round(
                     match_df,
                     round_number=i
                     )
-            
+
+            # ----- Buy phase: each player picks/keeps a loadout for this round -----
+            agent_side = {r["agent_name"]: ("attacker" if r["isAttacker"] == 1 else "defender")
+                          for _, r in match_df.iterrows()}
+            is_pistol = (i == 1 or i == 13)
+            round_buy = {}
+            for a in agents_in_match:
+                st = economy_state[a]
+                if is_pistol:
+                    wallet, carried = PISTOL_CREDITS, False
+                    buy = buy_loadout(wallet, sidearms, secondaries, gears)
+                elif st["died_prev"]:
+                    # Died last round -> reset to a pistol and re-buy within wallet.
+                    wallet, carried = st["wallet"], False
+                    buy = buy_loadout(wallet, sidearms, secondaries, gears)
+                else:
+                    # Survived -> carry the existing loadout, spend nothing.
+                    wallet, carried = st["wallet"], True
+                    buy = {
+                        "sidearm": st["sidearm"][0], "sidearm_cost": st["sidearm"][1],
+                        "secondary": st["secondary"][0], "secondary_cost": st["secondary"][1],
+                        "gear": st["gear"][0], "gear_cost": st["gear"][1], "spend": 0,
+                    }
+                credits_end = wallet - buy["spend"]
+                st["sidearm"] = (buy["sidearm"], buy["sidearm_cost"])
+                st["secondary"] = (buy["secondary"], buy["secondary_cost"])
+                st["gear"] = (buy["gear"], buy["gear_cost"])
+                st["wallet"] = credits_end  # round earnings get added in the settle phase
+                round_buy[a] = {
+                    "match_id": match_id, "round_id": round_id, "round_number": i,
+                    "user_id": agent_user.get(a), "agent_name": a,
+                    "team": agent_team.get(a), "side": agent_side.get(a),
+                    "is_pistol_round": is_pistol, "carried_loadout": carried,
+                    "credits_start": wallet,
+                    "sidearm": buy["sidearm"], "sidearm_cost": buy["sidearm_cost"],
+                    "secondary_weapon": buy["secondary"], "secondary_cost": buy["secondary_cost"],
+                    "gear": buy["gear"], "gear_cost": buy["gear_cost"],
+                    "spend": buy["spend"], "credits_end": credits_end,
+                }
+
             for row in match_df.itertuples(index=False):
                 row_dict = dict(zip(match_df.columns, row))
                 row_dict["round_id"] = round_id
@@ -274,6 +503,44 @@ def generating_full_match_details_per_round(
             defender_round_wins+= defender_round_win
             round_durations[round_id] = total_duration_round
             logging.debug(f"Round {i} - Attackers: {attacker_round_wins} wins, Defenders: {defender_round_wins} wins")
+
+            # ----- Settle phase: resolve outcome, pay credits, set up next round -----
+            winning_side = "attacker" if attacker_round_win == 1 else "defender"
+            planted_flag = bool(round_spike_stat["spike_planted"].iloc[0]) if "spike_planted" in round_spike_stat and len(round_spike_stat) else False
+            defused_flag = bool(round_spike_stat["spike_defused"].iloc[0]) if "spike_defused" in round_spike_stat and len(round_spike_stat) else False
+            detonated = planted_flag and not defused_flag
+            pp = per_player_round.fillna({"killed": 0, "death": 0})
+            kd = pp.set_index("agent_name")[["killed", "death"]].to_dict("index")
+
+            # Update each team's consecutive-loss streak from the round result.
+            for team in ("A", "B"):
+                team_side = next(agent_side[a] for a in agents_in_match if agent_team[a] == team)
+                if team_side == winning_side:
+                    loss_streak[team] = 0
+                else:
+                    loss_streak[team] += 1
+
+            for a in agents_in_match:
+                side = agent_side[a]
+                won = (side == winning_side)
+                kills = int(kd.get(a, {}).get("killed", 0) or 0)
+                died = bool(kd.get(a, {}).get("death", 0) or 0)
+                team = agent_team[a]
+                earnings = round_earnings(
+                    side=side, won=won, survived=not died, kills=kills,
+                    team_planted=planted_flag, spike_detonated=detonated,
+                    loss_streak=loss_streak[team],
+                )
+                st = economy_state[a]
+                st["wallet"] = min(MAX_CREDITS, st["wallet"] + earnings)
+                st["died_prev"] = died
+                row = round_buy[a]
+                row.update({
+                    "kills": kills, "survived": (not died), "round_won": won,
+                    "spike_planted": planted_flag, "credits_earned": earnings,
+                    "loss_streak": loss_streak[team],
+                })
+                economy_rows.append(row)
 
             if attacker_round_wins == 13 or defender_round_wins == 13:
                 logging.info(f"Match {match_id} ended in round {i}. Attackers: {attacker_round_wins}, Defenders: {defender_round_wins}")
@@ -298,8 +565,10 @@ def generating_full_match_details_per_round(
         round_status = round_df[["match_id","round_id"]].drop_duplicates().reset_index(drop=True)
         round_status["total_round_duration"] = round_status["round_id"].map(round_durations)
 
+        weapon_economy = pd.DataFrame(economy_rows)
+
         logging.info(f"Match details completed - {len(round_status)} rounds")
-        return match_status, round_status, agent_perf_status, round_spike_status, match_summary
+        return match_status, round_status, agent_perf_status, round_spike_status, match_summary, weapon_economy
     
     except Exception as e:
         error_msg = f"Error in generating_full_match_details_per_round: {str(e)}"
@@ -351,6 +620,12 @@ def events_per_round(
 
         for row in round_df.itertuples(index=False):
             row_dict = dict(zip(round_df.columns, row))
+            # Guarantee these keys exist on every player row. The simulation only
+            # sets "plants" on a living attacker and "defussed" on a living defender,
+            # so a round where neither branch fires for a side would otherwise drop
+            # the column entirely (KeyError downstream) or leave it NaN (bool(NaN) -> True).
+            row_dict.setdefault("plants", 0)
+            row_dict.setdefault("defussed", 0)
 
             row_dict, attacker_dict, defender_dict, team_spike_planted, team_spike_diffused, kill_count_attacker, kill_count_defender, attackers_alive, defenders_alive, agents_hit_damage,  kill_events, dead_attackers, dead_defenders = kill_death_simulation_by_damage(
                 row_dict=row_dict,
@@ -976,15 +1251,18 @@ def apply_radiant_change(state: dict, delta: int, RANK_TIERS: List) -> dict:
     state["points"] = new_pts
     return state
 
-def simulate_rank_progression(
+def update_ranks_for_match(
     match_summary: pd.DataFrame,
     match_df: pd.DataFrame,
     match_status: pd.DataFrame,
-    competitive_tiers: pd.DataFrame
-) -> pd.DataFrame:
+    competitive_tiers: List[str],
+    rank_states: Dict[int, dict],
+) -> List[dict]:
     """
-    Returns a rank_history df with one row per (match_id, user_id)
-    including rank/points before & after each match.
+    Apply one match's radiant-point deltas to rank_states (mutated in place) and
+    return one rank_history row per player, capturing rank/points before & after.
+    Called inside the chronological match loop so each player's rank is current
+    before the next match is formed.
     """
     ms_meta = build_match_summary_with_metadata(
         match_summary=match_summary,
@@ -992,15 +1270,8 @@ def simulate_rank_progression(
         match_status=match_status,
     )
 
-    RANK_TIERS = competitive_tiers
-
-    # Sort by match_id so progression is chronological
-    df = ms_meta.sort_values("match_id").reset_index(drop=True)
-
-    rank_states: dict[str, dict] = {}
-    history = []
-
-    for _, row in df.iterrows():
+    rows = []
+    for _, row in ms_meta.iterrows():
         user = row["user_id"]
         if user not in rank_states:
             rank_states[user] = initial_rank_state()
@@ -1015,9 +1286,9 @@ def simulate_rank_progression(
             team_acs_mean=float(row["team_acs_mean"]),
         )
 
-        new_state = apply_radiant_change(rank_states[user], delta, RANK_TIERS=RANK_TIERS)
+        new_state = apply_radiant_change(rank_states[user], delta, RANK_TIERS=competitive_tiers)
 
-        history.append({
+        rows.append({
             "match_id": row["match_id"],
             "user_id": user,
             "agent_name": row["agent_name"],
@@ -1027,13 +1298,13 @@ def simulate_rank_progression(
             "avg_combat_score": float(row["ACV"]),
             "team_acs_mean": float(row["team_acs_mean"]),
             "radiant_delta": delta,
-            "rank_before": RANK_TIERS[prev_state["rank_index"]],
+            "rank_before": competitive_tiers[prev_state["rank_index"]],
             "points_before": prev_state["points"],
-            "rank_after": RANK_TIERS[new_state["rank_index"]],
+            "rank_after": competitive_tiers[new_state["rank_index"]],
             "points_after": new_state["points"],
         })
 
-    return pd.DataFrame(history)
+    return rows
 
 
 if __name__ == "__main__":
@@ -1046,28 +1317,27 @@ if __name__ == "__main__":
         users_df = pd.read_csv("data/users_dim.csv", parse_dates=["join_date"])
         agents_df = pd.read_csv("data/agents_dim.csv")
         maps_df = pd.read_csv("data/maps_dim.csv")
+        weapons_df = pd.read_csv("data/weapons_dim.csv")
+        gears_df = pd.read_csv("data/gears_dim.csv")
         logging.info(f"Successfully loaded input files - users: {users_df.shape}, agents: {agents_df.shape}, maps: {maps_df.shape}")
-        
-        logging.info("Generating match timeline...")
-        match_status, round_status, agent_perf_status, round_spike_status, match_df, match_summary = generate_all_match_details(
-            users_df,
-            agents_df,
-            maps_df
-        )
-        
+
         competitive_tiers_all = pd.read_csv("data/competitive_tiers_dim.csv")["Rank"].tolist()
         remove = {"Unused1", "Unused2"}
-        competitive_tiers = [x for x in competitive_tiers_all if x not in remove]  
+        competitive_tiers = [x for x in competitive_tiers_all if x not in remove]
 
-        rank_history = simulate_rank_progression(
-        match_summary=match_summary,
-        match_df=match_df,
-        match_status=match_status,
-        competitive_tiers = competitive_tiers
+        logging.info("Generating match timeline...")
+        match_status, round_status, agent_perf_status, round_spike_status, match_df, match_summary, rank_history, weapon_economy = generate_all_match_details(
+            users_df,
+            agents_df,
+            maps_df,
+            competitive_tiers,
+            weapons_df,
+            gears_df,
         )
 
         rank_history.to_csv("data/rank_history.csv", index=False)
-        
+        weapon_economy.to_csv("data/weapon_economy.csv", index=False)
+
         match_df.to_csv("data/match_df.csv")
 
         
